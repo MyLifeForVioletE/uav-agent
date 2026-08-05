@@ -1,0 +1,1 @@
+invalid type: string "## 阶段6:全域任务完成返航\n- 等待地面站确认目标全部素材采集完毕\n    - executor: system\n    - goal: \"确认侦察素材采集完毕\"\n- 生成从当前位置到目标点的航线\n    - executor: tool\n    - goal: \"从无人机当前位置规划返回起始点的航线\"\n    - post_action_update: {\"uav.position\": \"targetPosition\"}\n expecte

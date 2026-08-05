@@ -1,0 +1,141 @@
+"""call_llm 节点：调用 Ollama API 并处理响应"""
+import json
+import sys
+
+import requests
+from langchain_core.messages import HumanMessage, AIMessage
+
+from core.config import OLLAMA_BASE, MODEL
+from core.state import AgentState, Deps
+from core.ollama_utils import messages_to_ollama, tools_to_ollama
+from agent.nodes.planning import _extract_json
+
+
+async def call_llm(state: AgentState, deps: Deps) -> AgentState:
+    """call_llm 节点：直接调 Ollama API（带 tools），将回复存入消息列表。"""
+    uid = state.get("user_input")
+    if uid:
+        state["messages"].append(HumanMessage(content=uid))
+    state["user_input"] = None
+    messages = state["messages"]
+    o_messages = messages_to_ollama(messages)
+    # 宏观/详细规划阶段禁止工具调用，强制 LLM 只输出文本/JSON
+    if ("task_planning" in (state.get("_skill_injected") or set()) and not state.get("plan_generated")) or \
+       (state.get("macro_plan_confirmed") and not state.get("detail_plan_done")) or \
+       (state.get("detail_plan_done") and not state.get("detail_plan_confirmed")):
+        o_tools = []
+    else:
+        o_tools = tools_to_ollama(deps.tools)
+
+    try:
+        body = {
+            "model": MODEL,
+            "messages": o_messages,
+            "stream": False,
+            "options": {"temperature": 0, "num_predict": 4096},
+        }
+        if o_tools:
+            body["tools"] = o_tools
+        resp = requests.post(
+            f"{OLLAMA_BASE}/api/chat",
+            json=body,
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        o_msg = data.get("message", {})
+        content = o_msg.get("content", "")
+        o_tcs = o_msg.get("tool_calls", [])
+    except Exception as e:
+        detail = ""
+        if hasattr(e, "response") and e.response is not None:
+            try:
+                detail = e.response.text[:500]
+            except Exception:
+                pass
+        aim = AIMessage(content=f"（调用 Ollama 失败：{e}\n{detail}）")
+        state["messages"].append(aim)
+        state["output"] = aim.content
+        state["_tool_calls"] = None
+        state["_last_response"] = aim
+        state["pending_question"] = aim.content
+        return state
+
+    # 将 Ollama tool_calls 转为 LangChain 格式
+    tool_calls = []
+    for tc in o_tcs:
+        func = tc.get("function", {})
+        name = func.get("name", "")
+        raw_args = func.get("arguments", "{}")
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                args = {}
+        else:
+            args = raw_args
+        tool_calls.append({
+            "name": name,
+            "args": args,
+            "id": f"call_{name}_{len(tool_calls)}",
+        })
+
+    # 构造 AIMessage
+    additional_kwargs = {}
+    if o_tcs:
+        additional_kwargs["tool_calls"] = o_tcs
+    aim_kw = {"content": content, "additional_kwargs": additional_kwargs}
+    if tool_calls:
+        aim_kw["tool_calls"] = tool_calls
+    aim = AIMessage(**aim_kw)
+    state["messages"].append(aim)
+    state["output"] = content or ""
+    state["_tool_calls"] = tool_calls if tool_calls else None
+    state["_last_response"] = aim
+
+    if not tool_calls and content:
+        state["pending_question"] = content
+
+    # 检测 LLM 是否输出了宏观规划（JSON 格式含 macro_phases 或其别名），标记 plan_generated
+    # 规范化字段名：LLM 可能输出 stages/stage_id/stage_name 而非 macro_phases/phase_id/phase_name
+    _normalized = content
+    _normalized = _normalized.replace('"stages"', '"macro_phases"')
+    _normalized = _normalized.replace('"stage_id"', '"phase_id"')
+    _normalized = _normalized.replace('"stage_name"', '"phase_name"')
+    if '"macro_phases"' in content:
+        state["plan_generated"] = True
+    elif '"macro_phases"' in _normalized:
+        # 更新 content/output/pending_question 使用规范化后的版本
+        content = _normalized
+        state["output"] = content
+        state["pending_question"] = content
+        state["plan_generated"] = True
+        # 修正消息历史中存储的 AIMessage content
+        if state["messages"]:
+            last = state["messages"][-1]
+            if hasattr(last, "content") and isinstance(last.content, str) and '"stages"' in last.content:
+                last.content = _normalized
+
+    # 详细规划进行中：解析当前阶段的原子动作并累积
+    if state.get("macro_plan_confirmed") and not state.get("detail_plan_done") and state.get("current_phase_idx", -1) >= 0:
+        data = _extract_json(content)
+        if data:
+            actions = data.get("actions", [])
+            if actions:
+                state["detail_actions"] = state.get("detail_actions", []) + actions
+                sys.stderr.write(f"[LLM] 累积 {len(actions)} 个原子动作，总计 {len(state['detail_actions'])} 个\n"); sys.stderr.flush()
+        # 检查是否所有阶段都已拆解完毕
+        phases = state.get("macro_phases", [])
+        idx = state.get("current_phase_idx", 0)
+        if phases and idx >= len(phases) - 1:
+            state["detail_plan_done"] = True
+            # 整合输出全部阶段的原子动作
+            all_actions = state.get("detail_actions", [])
+            consolidated = {"actions": all_actions}
+            consolidated_text = json.dumps(consolidated, ensure_ascii=False, indent=4)
+            summary = f"全部 {len(phases)} 个阶段拆解完毕，共 {len(all_actions)} 个原子动作：\n\n```json\n{consolidated_text}\n```\n\n是否确认以上详细规划方案？"
+            state["output"] = summary
+            state["pending_question"] = summary
+            sys.stderr.write(f"[LLM] 所有 {len(phases)} 个阶段拆解完毕，总计 {len(all_actions)} 个原子动作\n"); sys.stderr.flush()
+
+    return state

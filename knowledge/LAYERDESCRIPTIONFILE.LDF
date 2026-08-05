@@ -1,0 +1,47 @@
+
+[Common]
+Date                                             = (cstring)                           "14.12.2016"
+Version                                          = (cstring)                                "1.0.0"
+
+[Filenames]
+Prefix                                           = (cstring)                         "DEM_China90m"
+Delimiter                                        = (cstring)                                    "_"
+XSuffix                                          = (cstring)                                   "00"
+YSuffix                                          = (cstring)                                   "00"
+
+[DataDescription]
+XPixel                                           = (long)                                      1000
+YPixel                                           = (long)                                      1000
+BitsPerPixel                                     = (long)                                        16
+PixelDataType                                    = (cstring)                                "short"
+FileType                                         = (cstring)                               "Binary"
+ByteOrder                                        = (cstring)                            "BigEndian"
+InvertByte                                       = (cstring)                                "FALSE"
+OffsetBytes                                      = (long)                                         0
+FixScale                                         = (cstring)                                "FALSE"
+Multiplier                                       = (double)                            1.0000000000
+Offset                                           = (double)                            0.0000000000
+MappingFile                                      = (cstring)                                     ""
+PresentationFile                                 = (cstring)                     "DEM_China90m.prs"
+Direction                                        = (cstring)                   "Rows_Bottom_To_Top"
+
+[LayerDescription]
+TypeID                                           = (cstring)                                  "LuS"
+DataType                                         = (cstring)                                 "Topo"
+DefaultLayerName                                 = (cstring)                         "DEM_China90m"
+CoordSystem                                      = (cstring)                 "Long - Lat  -WGS 84-"
+ReferencePoint                                   = (cstring)                      "LowerLeftCorner"
+Units                                            = (cstring)                               "degree"
+RefPointX                                        = (double)                           69.9995835755
+RefPointY                                        = (double)                           14.9995837934
+AreaExtendX                                      = (double)                           65.8333333333
+AreaExtendY                                      = (double)                           40.8333333333
+ResolutionX                                      = (double)                            0.0008333333
+ResolutionY                                      = (double)                            0.0008333333
+DefaultValue                                     = (double)                        -9999.0000000000
+ColourTable                                      = (cstring)                                     ""
+
+[Info]
+Comment                                          = (cstring)                            "Kommentar"
+MinValue                                         = (double)                       -32767.0000000000
+MaxValue                                         = (double)                        32767.0000000000

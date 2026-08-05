@@ -1,0 +1,9 @@
+langgraph
+langchain-ollama
+langchain-core
+langchain-mcp-adapters
+chromadb
+openpyxl
+pydantic
+requests
+redis>=5.0.0

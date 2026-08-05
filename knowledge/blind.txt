@@ -1,0 +1,2 @@
+# Blind areas are treated as blocked.
+rect 11 4 13 6

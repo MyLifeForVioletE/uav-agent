@@ -1,0 +1,31 @@
+{
+    "stages":[
+        {
+            "stage":"mission_extraction",
+            "description":"从用户自然语言中提取任务需求",
+            "schemas":[
+                {
+                    "name":"mission_requirement",
+                    "file":"mission/Reconnaissance.json",
+                    "usage":"提取任务类型、目标等信息"
+                }
+            ]
+        },
+        {
+            "stage":"planning_generation",
+            "description":"生成任务规划",
+            "schemas":[
+                {
+                    "name":"macroPlan",
+                    "file":"plan/macro_plan.json",
+                    "usage":"针对任务生成宏观规划"
+                },
+                {
+                    "name":"atomic",
+                    "file":"plan/atomic_action.json",
+                    "usage":"详细规划中分解到原子化"
+                }
+            ]
+        }
+    ]
+}
