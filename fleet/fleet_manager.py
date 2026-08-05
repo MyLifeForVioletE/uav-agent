@@ -33,12 +33,11 @@ class FleetManager:
         self._planned_tasks: set = set()              # 已规划但未执行的任务
         self._saved_plans: dict = {}                  # task_id → {detail_actions}
         self._phase: str = "planning"                 # "planning" | "execution"
-        self._coordinator_agent: SubAgent | None = None  # 分析决策类子任务的 agent
         self._info_processor_agent: SubAgent | None = None  # 信息处理类子任务的 agent
         self._bus = get_kafka_bus()
     
     def initialize_sub_agents(self, state: AgentState):
-        """根据 uav_configs 创建子 agent 实例 + 创建 coordinator agent"""
+        """根据 uav_configs 创建子 agent 实例 + 创建信息处理 agent"""
         configs = state.get("uav_configs", [])
         assignments = state.get("sub_task_assignments", {})
         session_id = state.get("session_id", "default")
@@ -55,16 +54,6 @@ class FleetManager:
             # 建立 task_id -> agent_id 映射
             for tid in task_ids:
                 self.task_to_agent[tid] = uav_id
-        
-        # 创建 coordinator agent（分析决策类子任务）
-        self._coordinator_agent = SubAgent(
-            agent_id=self._COORD_ID, deps=self.deps,
-            initial_config={}, mode="coordinator", redis_mgr=self.redis_mgr, session_id=session_id
-        )
-        coord_task_ids = assignments.get("coordinator", [])
-        self._coordinator_agent._assigned_task_ids = coord_task_ids
-        for tid in coord_task_ids:
-            self.task_to_agent[tid] = self._COORD_ID
 
         # 创建信息处理 agent（基于无人机采集数据的分析处理类子任务）
         self._info_processor_agent = SubAgent(
@@ -456,10 +445,8 @@ class FleetManager:
             state["_current_task_idx"] = current_task_idx + 1
             return
         
-        # 获取对应的 agent（UAV 子 agent / coordinator / info_processor）
-        if agent_id == self._COORD_ID:
-            agent = self._coordinator_agent
-        elif agent_id == self._INFO_PROCESSOR_ID:
+        # 获取对应的 agent（UAV 子 agent / info_processor）
+        if agent_id == self._INFO_PROCESSOR_ID:
             agent = self._info_processor_agent
         else:
             agent = self.sub_agents.get(agent_id)
@@ -657,21 +644,11 @@ class FleetManager:
                 "detail_actions": ip.state.get("detail_actions", []),
             }
 
-        if self._coordinator_agent:
-            ca = self._coordinator_agent
-            results["coordinator_results"] = {
-                "status": ca.status,
-                "progress": ca.progress,
-                "output": ca.last_output,
-                "detail_actions": ca.state.get("detail_actions", []),
-            }
-
         return results
     
     def reset(self):
         """重置Fleet管理器"""
         self.sub_agents.clear()
-        self._coordinator_agent = None
         self._info_processor_agent = None
         self.task_to_agent.clear()
         self._running_tasks.clear()

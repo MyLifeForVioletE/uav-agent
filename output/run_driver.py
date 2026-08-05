@@ -8,11 +8,9 @@ BASE = r"C:\Users\EHz\Desktop\uavAgentPlanning"
 sys.path.insert(0, BASE)
 
 from langchain_core.messages import SystemMessage
-from langchain_core.tools import Tool
 from langchain_ollama import ChatOllama
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
-from pydantic import BaseModel, Field
 
 from core.config import OLLAMA_BASE, MODEL, BASE_DIR
 from core.state import Deps, default_agent_state
@@ -20,7 +18,6 @@ from core.prompts import SYSTEM_PROMPT
 from core.redis_manager import get_redis_manager
 from agent.coordinator import build_coordinator_graph
 from rag import TaskPlanner
-from tools.scene_builder import build_scene
 
 
 async def main():
@@ -49,11 +46,7 @@ async def main():
         decomposer_planner = TaskPlanner(docs_dir=rag_base, collection_name="decomposer_rag", glob_include=["task_decomposition/*.md"])
         macro_planner.index_docs(); constraint_planner.index_docs(); detail_planner.index_docs(); decomposer_planner.index_docs()
 
-        class SceneBuildingInput(BaseModel):
-            scene_description: str = Field(description="场景描述")
-        scene_building_tool = Tool.from_function(name="scene_building", func=build_scene, args_schema=SceneBuildingInput,
-                                                 description="仅当用户明确说'生成场景'或'构建场景'时调用")
-        tool_map = {t.name: t for t in algo_tools + [scene_building_tool]}
+        tool_map = {t.name: t for t in algo_tools}
         llm_plain = ChatOllama(model=MODEL, temperature=0, base_url=OLLAMA_BASE)
         deps = Deps(tools=tool_map, llm_no_tools=llm_plain, macro_planner=macro_planner, constraint_planner=constraint_planner,
                     detail_planner=detail_planner, decomposer_planner=decomposer_planner)

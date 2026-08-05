@@ -5,20 +5,16 @@ import uuid
 from pathlib import Path
 
 from langchain_core.messages import SystemMessage
-from langchain_core.tools import Tool
 from langchain_ollama import ChatOllama
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
-from pydantic import BaseModel, Field
 
 from core.config import OLLAMA_BASE, MODEL, BASE_DIR
 from core.state import AgentState, Deps, default_agent_state
 from core.prompts import SYSTEM_PROMPT
 from core.redis_manager import get_redis_manager
-from agent.graph import build_graph
 from agent.coordinator import build_coordinator_graph
 from rag import TaskPlanner
-from tools.scene_builder import build_scene
 
 
 async def main():
@@ -76,20 +72,9 @@ async def main():
         detail_planner.index_docs()
         decomposer_planner.index_docs()
 
-        # 场景构建工具
-        class SceneBuildingInput(BaseModel):
-            scene_description: str = Field(description="用户的自然语言场景描述，包含载体、装备、天线、项目等具体信息")
-
-        scene_building_tool = Tool.from_function(
-            name="scene_building",
-            func=build_scene,
-            args_schema=SceneBuildingInput,
-            description="仅当用户明确说'生成场景'或'构建场景'时调用（这是电磁场景配置，包含载体、装备、天线、项目等），与任务规划（侦察/巡检/评估）无关。其他情况不要调用此工具。",
-        )
-
         # 合并工具
-        all_tools = algo_tools + [scene_building_tool]
-        print(f"  已注册 {len(algo_tools)} 个算法工具 + 1 个辅助工具 (scene_building)", flush=True)
+        all_tools = algo_tools
+        print(f"  已注册 {len(algo_tools)} 个算法工具", flush=True)
         print(f"  场景规划器 ({macro_planner.doc_count} 条) + 约束规划器 ({constraint_planner.doc_count} 条) + 详细规划器 ({detail_planner.doc_count} 条)", flush=True)
         print("=" * 60, flush=True)
         print("  模型随时根据你的需求选择合适的算法调用", flush=True)

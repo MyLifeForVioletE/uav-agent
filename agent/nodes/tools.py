@@ -146,8 +146,4 @@ async def execute_tools(state: AgentState, deps: Deps) -> AgentState:
         state["pending_question"] = " "
         return state
 
-    # scene_building 执行成功 → 展示结果，等待用户输入，不要自动回 LLM
-    if any(tc["name"] == "scene_building" for tc in tcs):
-        state["pending_question"] = " "
-
     return state

@@ -30,7 +30,6 @@ class SubAgent:
     
     支持两种模式：
     - "uav"：无人机子 agent，生成 UAV 专属的任务描述
-    - "coordinator"：分析决策协调 agent，生成分析类任务描述
     - "info_processor"：信息处理 agent，生成对无人机采集数据的分析处理类任务描述
     """
     
@@ -203,15 +202,7 @@ class SubAgent:
                 pass
         
         # 根据模式构造不同描述
-        if self.mode == "coordinator":
-            task_desc = (
-                f"你是多无人机协同任务的分析决策协调者。\n"
-                f"请对以下分析决策类子任务进行规划：\n"
-                f"- 任务名称：{task.get('task_name', '')}\n"
-                f"- 任务目标：{task.get('goal', '')}\n"
-                f"{context_block}"
-            )
-        elif self.mode == "info_processor":
+        if self.mode == "info_processor":
             task_desc = (
                 f"你是信息处理 agent。请根据以下分析子任务，从可用算法工具中选择最匹配的算法，"
                 f"从任务描述、上下文或前置任务结果中提取所需参数，然后直接调用该算法工具。\n"

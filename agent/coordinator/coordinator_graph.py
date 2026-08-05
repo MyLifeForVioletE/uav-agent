@@ -14,7 +14,6 @@ from agent.coordinator.coordinator_nodes import (
 )
 from agent.coordinator.coordinator_routes import (
     route_coordinator_idle,
-    route_coordinator_router,
     route_after_collect,
     route_after_decompose,
     route_after_allocate,
@@ -84,10 +83,7 @@ def build_coordinator_graph(deps: Deps):
         END: END,
     })
     
-    builder.add_conditional_edges("router", route_coordinator_router, {
-        "parameter_collector": "parameter_collector",
-        "single_agent": END,  # 非协同任务直接结束（交由单机图处理）
-    })
+    builder.add_edge("router", "parameter_collector")
     
     builder.add_conditional_edges("parameter_collector", route_after_collect, {
         "idle": "idle",

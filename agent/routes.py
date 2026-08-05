@@ -12,9 +12,7 @@ def route_idle(state: AgentState) -> str:
 def route_router(state: AgentState) -> str:
     """router → 按 _intent 分派到下游节点"""
     intent = state.pop("_intent", "chat")
-    if intent == "scene":
-        return "scene_node"
-    elif intent in ("planning", "confirm"):
+    if intent in ("planning", "confirm"):
         return "planning_prep"
     elif intent == "detail_planning":
         return "call_llm"
@@ -25,11 +23,6 @@ def route_router(state: AgentState) -> str:
 def route_planning_prep(state: AgentState) -> str:
     """planning_prep → 始终去 call_llm"""
     return "call_llm"
-
-
-def route_scene(state: AgentState) -> str:
-    """scene_node → 回到 idle 等用户"""
-    return "idle"
 
 
 def route_call_llm(state: AgentState) -> str:

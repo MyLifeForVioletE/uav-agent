@@ -74,56 +74,20 @@ def router_node(state: AgentState, deps: Deps = None) -> AgentState:
         state["_intent"] = "detail_planning"
         return state
 
-    # 首次意图分类
+    # 首次进入：子agent 任务已由指挥分配，直接进入任务规划，不做 scene/calc 等意图分类
     if not state.get("plan_generated"):
-        if state.get("_is_sub_task"):
-            # 子agent：任务已由指挥分配，直接进入任务规划，不做 scene/calc 等意图分类
-            intent = "planning"
-            sys.stderr.write("[Router] subtask -> intent=planning\n"); sys.stderr.flush()
-        else:
-            try:
-                resp = requests.post(
-                    f"{OLLAMA_BASE}/api/chat",
-                    json={
-                        "model": MODEL,
-                        "messages": [
-                            {"role": "system", "content": "判断用户意图，只输出一个词。\n"
-                             "scene - 用户要构建/生成电磁场景（含载体、装备、天线、项目等配置信息）\n"
-                             "planning - 用户要做侦察/巡检/评估等需要任务规划的任务\n"
-                             "calc - 用户只要求单步计算（点场强、遮蔽角等）\n"
-                             "other - 其他"},
-                            {"role": "user", "content": uid},
-                        ],
-                        "stream": False,
-                        "options": {"temperature": 0},
-                    },
-                    timeout=30,
-                )
-                intent = resp.json()["message"]["content"].strip().lower()
-                sys.stderr.write(f"[Router] intent={intent}\n"); sys.stderr.flush()
-            except Exception as e:
-                sys.stderr.write(f"[Router] intent error: {e}\n"); sys.stderr.flush()
-                intent = "chat"
-
-        state["_intent"] = intent
+        state["_intent"] = "planning"
+        sys.stderr.write("[Router] subtask -> intent=planning\n"); sys.stderr.flush()
 
         injected = state.get("_skill_injected") or set()
 
         # planning 意图：注入任务规划 skill
-        if intent == "planning" and "task_planning" not in injected:
+        if "task_planning" not in injected:
             skill_content = load_skill("task_planning.md")
             if skill_content:
                 state["messages"].append(SystemMessage(content=skill_content))
                 injected.add("task_planning")
                 sys.stderr.write(f"[Skill] 已注入 task_planning.md\n"); sys.stderr.flush()
-
-        # scene 意图：注入场景构建 skill
-        if intent == "scene" and "scene" not in injected:
-            skill_content = load_skill("scene.md")
-            if skill_content:
-                state["messages"].append(SystemMessage(content=skill_content))
-                injected.add("scene")
-                sys.stderr.write(f"[Skill] 已注入 scene.md\n"); sys.stderr.flush()
 
         state["_skill_injected"] = injected
         return state

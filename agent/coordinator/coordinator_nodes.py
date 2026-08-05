@@ -88,15 +88,10 @@ def coordinator_idle_node(state: AgentState, deps: Deps) -> AgentState:
 def coordinator_router_node(state: AgentState, deps: Deps) -> AgentState:
     """
     Coordinator 路由节点：
-    - 分析用户意图是否涉及多机协同
+    - 统一走协同流程（拆分配给 UAV 子 agent 执行）
     """
     uid = state.get("user_input", "")
-    if not uid:
-        state["_coordinator_intent"] = "chat"
-        return state
-    
     state["collaboration_mode"] = "multi"
-    state["_coordinator_intent"] = "fleet_planning"
     if not state.get("original_scenario"):
         state["original_scenario"] = uid
     
@@ -284,7 +279,7 @@ def task_decomposer_node(state: AgentState, deps: Deps) -> AgentState:
 - scenario: 对本次任务场景的一句话概括，如"单架无人机对单个目标进行侦察"
 - task_name: 子任务的动作名称，直接用用户说的动作词，注意加上对象，如"无人机1侦察目标2""信息处理agent分析目标1带宽、场强""无人机2对目标1实施干扰"
 - goal: 子任务的具体目标，写明该子任务要产出什么。采集类子任务写原始数据（如"获取目标的扫频数据"），分析类子任务写最终期望信息（如"获取目标的频率、带宽、信号强度"）。**不同子任务的 goal 不要互相重复**。
-- executor: "uav"=无人机agent执行，"info_processor"=信息处理agent执行，"coordinator"=主agent执行
+- executor: "uav"=无人机agent执行，"info_processor"=信息处理agent执行
 - assigned_uav_role: 无人机角色，scout=侦察，jammer=干扰
 - prerequisite_tasks: 前置依赖的任务ID列表，没有依赖则填[]
 - constraints: 约束条件，没有则填[]
@@ -321,7 +316,6 @@ assigned_uav_role 必须与用户说的无人机类型一致。
   - 任何基于无人机采集数据的分析计算任务
   - 以上【可用的算法工具】中"角色归属"含 info_processor 的算法，应由信息处理agent执行
   - 注意：如果该处理任务依赖无人机的采集结果，必须把对应的采集子任务填进 prerequisite_tasks
-- "coordinator"：由主agent执行，仅适用于最终决策判断与全局信息汇总。主agent不执行具体的数据分析。
 
 注意：
 1. **用户说的每一个执行动作都必须生成对应的子任务**。用户说了"侦察"，就必须有侦察子任务；说了"分析数据"，就必须有分析子任务；说了"干扰"，就必须有干扰子任务。
@@ -491,17 +485,15 @@ def task_allocator_node(state: AgentState, deps: Deps) -> AgentState:
     # 执行分配
     assignments = allocator.allocate(uav_task_objects, uav_configs)
     
-    # 为 coordinator / info_processor 任务添加标记
+    # 为 info_processor 任务添加标记（其余非 uav 任务兜底交给信息处理 agent）
     for task in sub_tasks:
-        if task.get("executor") == "coordinator":
-            assignments.setdefault("coordinator", []).append(task.get("task_id", ""))
-        elif task.get("executor") == "info_processor":
+        if task.get("executor") != "uav":
             assignments.setdefault("info_processor", []).append(task.get("task_id", ""))
 
     state["sub_task_assignments"] = assignments
 
-    # 初始化活跃 UAV 列表（不含 coordinator / info_processor）
-    state["active_uav_ids"] = [k for k in assignments.keys() if k not in ("coordinator", "info_processor")]
+    # 初始化活跃 UAV 列表（不含 info_processor）
+    state["active_uav_ids"] = [k for k in assignments.keys() if k != "info_processor"]
     
     # 生成分配展示文本
     output = "=" * 60 + "\n"
@@ -513,10 +505,7 @@ def task_allocator_node(state: AgentState, deps: Deps) -> AgentState:
         goal = task.get("goal", "")
         executor = task.get("executor", "uav")
         
-        if executor == "coordinator":
-            assignee = "主Agent（协调者）"
-            role_info = ""
-        elif executor == "info_processor":
+        if executor != "uav":
             assignee = "信息处理Agent"
             role_info = ""
         else:
@@ -576,9 +565,7 @@ async def fleet_dispatcher_node(state: AgentState, deps: Deps) -> AgentState:
         task_id = state["_sub_awaiting"]
         agent_id = fleet_mgr.task_to_agent.get(task_id)
         if agent_id:
-            if agent_id == FleetManager._COORD_ID:
-                fleet_mgr._coordinator_agent.inject_user_input(state["user_input"])
-            elif agent_id == FleetManager._INFO_PROCESSOR_ID:
+            if agent_id == FleetManager._INFO_PROCESSOR_ID:
                 fleet_mgr._info_processor_agent.inject_user_input(state["user_input"])
             else:
                 agent = fleet_mgr.sub_agents.get(agent_id)
@@ -610,14 +597,12 @@ async def fleet_dispatcher_node(state: AgentState, deps: Deps) -> AgentState:
         executor = task.get("executor", "uav")
         
         # 找到执行者
-        if executor == "coordinator":
-            executor_label = "主Agent"
-        elif executor == "info_processor":
+        if executor != "uav":
             executor_label = "信息处理Agent"
         else:
             executor_label = "未分配"
             for uav_id, task_ids in assignments.items():
-                if task_id in task_ids and uav_id not in ("coordinator", "info_processor"):
+                if task_id in task_ids and uav_id != "info_processor":
                     executor_label = uav_id
                     break
         

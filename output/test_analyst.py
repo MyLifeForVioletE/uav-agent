@@ -17,7 +17,6 @@ from pydantic import BaseModel, Field
 from core.config import OLLAMA_BASE, MODEL, BASE_DIR
 from core.state import Deps
 from core.redis_manager import get_redis_manager
-from tools.scene_builder import build_scene
 from agent.sub_agent import SubAgent
 
 

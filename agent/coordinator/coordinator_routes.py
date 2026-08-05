@@ -25,14 +25,6 @@ def route_coordinator_idle(state: AgentState) -> str:
     return END
 
 
-def route_coordinator_router(state: AgentState) -> str:
-    """router → 按意图分派"""
-    intent = state.get("_coordinator_intent", "")
-    if intent == "fleet_planning":
-        return "parameter_collector"
-    return "single_agent"
-
-
 def route_after_collect(state: AgentState) -> str:
     """parameter_collector → 有pending_question则idle等确认，否则task_decomposer"""
     if state.get("pending_question"):
