@@ -1,0 +1,1 @@
+[UAV_1 步骤 5/8] 执行扫频数据采集 | sweepFrequencyReconnaissance(target_frequency=确认, step=500)

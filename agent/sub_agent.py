@@ -56,6 +56,14 @@ class SubAgent:
         self._bus = get_kafka_bus()
         self._awaiting_reply: str | None = None   # 同步请示：等待的 correlation_id
 
+        # 规划上报：宏观/详细规划已上报标记（避免重复上报）
+        self._reported_macro_plan = False
+        self._reported_detail_plan = False
+        # 缺参请求挂起信息：{action, step_idx, missing_params}
+        self._pending_resolution: dict | None = None
+        # 指挥回复提供的参数值：{param_name: value}
+        self._pending_param_values: dict | None = None
+
     def _filter_deps(self, deps) -> Deps:
         """按 mode 过滤可用工具表，其余依赖（规划器/LLM）保持不变"""
         tools = filter_tools_for_role(deps.tools, self.mode)
@@ -160,9 +168,7 @@ class SubAgent:
                 if mtype == "reply" and self._awaiting_reply:
                     if m.get("correlation_id") == self._awaiting_reply:
                         self._awaiting_reply = None
-                        self.state["messages"].append(SystemMessage(content=f"[指挥回复] {content}"))
-                        sys.stderr.write(f"[SubAgent {self.agent_id}] 收到指挥回复，解除挂起\n")
-                        sys.stderr.flush()
+                        await self._handle_command_reply(m)
                         continue
                 self.state["messages"].append(
                     SystemMessage(content=f"[来自 {from_id} 的消息({mtype})] {content}")
@@ -284,6 +290,8 @@ class SubAgent:
             self.state = await self.graph.ainvoke(self.state, {"recursion_limit": 50})
             self.last_output = self.state.get("output", "")
             self._sync_status()
+            # 向指挥上报已生成的宏观/详细规划
+            await self._report_plans_if_ready()
         except Exception as e:
             self.status = "error"
             self.error = str(e)
@@ -318,12 +326,24 @@ class SubAgent:
         if action.get("executor") == "tool" and "tool_inputs" in action:
             action["tool_inputs"] = {}
 
+        # 注入指挥提供的参数值（用户回答 / 指挥推导补充）
+        if self._pending_param_values:
+            action.setdefault("tool_inputs", {})
+            for k, v in self._pending_param_values.items():
+                action["tool_inputs"][k] = v
+            sys.stderr.write(f"[SubAgent {self.agent_id}] 注入指挥提供的参数: {self._pending_param_values}\n")
+            sys.stderr.flush()
+            self._pending_param_values = None
+
         context = {
             "tools": self.deps.tools,
             "messages": self.state["messages"],
             "llm": self.deps.llm_no_tools,
             "state": self.state,
         }
+
+        # 向指挥上报当前正在执行的动作（处理前先报一次，让指挥感知执行开始）
+        await self._report_action_start(action, idx, len(actions))
 
         sys.stderr.write(f"[SubAgent {self.agent_id}] 执行步骤 {idx+1}/{len(actions)}: {action.get('action_name', '')}\n")
         sys.stderr.flush()
@@ -335,6 +355,14 @@ class SubAgent:
             self.error = str(e)
             self.last_output = f"执行失败: {e}"
             return
+
+        # 缺少参数 → 向指挥请求解决，暂停本步骤（不推进索引、不置错误）
+        if result.get("missing_params"):
+            await self._request_param_resolution(action, result.get("missing_params", []))
+            return
+
+        # 动作已执行：把动作及实际解析的参数值上报指挥（写脚本文件）
+        await self._report_action_executed(action, result, idx, len(actions))
 
         self.state["current_step_idx"] = idx + 1
         self.last_output = result.get("output", "")
@@ -383,6 +411,148 @@ class SubAgent:
         except Exception as e:
             sys.stderr.write(f"[SubAgent {self.agent_id}] 结果上报失败: {e}\n")
             sys.stderr.flush()
+
+    async def _report_plans_if_ready(self):
+        """向指挥上报已生成的宏观/详细规划（每个规划只上报一次）"""
+        # 宏观规划
+        if not self._reported_macro_plan:
+            from agent.nodes.planning import _find_macro_plan_json
+            macro = self.state.get("macro_phases", [])
+            if not macro and self.state.get("plan_generated"):
+                macro = _find_macro_plan_json(self.state.get("messages", [])) or []
+            if macro:
+                self._reported_macro_plan = True
+                await self._send_report("macro_plan", {"macro_phases": macro})
+        # 详细规划
+        if not self._reported_detail_plan:
+            actions = self.state.get("detail_actions", [])
+            if actions and self.state.get("detail_plan_done"):
+                self._reported_detail_plan = True
+                await self._send_report("detail_plan", {"detail_actions": actions})
+
+    async def _report_action_start(self, action: dict, idx: int, total: int):
+        """向指挥上报当前正在执行的原子动作"""
+        await self._send_report("action_start", {
+            "action": action,
+            "step_idx": idx,
+            "total": total,
+        })
+
+    async def _report_action_executed(self, action: dict, result: dict, idx: int, total: int):
+        """动作执行后：把动作及实际解析出的调用参数值上报指挥（用于写脚本文件）"""
+        await self._send_report("action_executed", {
+            "action": action,
+            "step_idx": idx,
+            "total": total,
+            "success": result.get("success", False),
+            "output": str(result.get("output", ""))[:500],
+        })
+
+    async def _send_report(self, report_type: str, extra: dict = None):
+        """发 report 消息给指挥（非阻塞），payload 携带结构化上报内容"""
+        if not self._bus:
+            return
+        task = self._current_task or {}
+        payload = dict(extra or {})
+        payload.update({
+            "report_type": report_type,
+            "task_id": task.get("task_id", ""),
+            "task_name": task.get("task_name", ""),
+        })
+        try:
+            await self._send_message(
+                COORDINATOR_ID, "report",
+                f"{self.agent_id} 上报 {report_type}",
+                payload=payload,
+            )
+        except Exception as e:
+            sys.stderr.write(f"[SubAgent {self.agent_id}] {report_type} 上报失败: {e}\n")
+            sys.stderr.flush()
+
+    async def _request_param_resolution(self, action: dict, missing_params: list):
+        """缺参：向指挥发送 request，等待指挥回复（推导算法 / 询问用户）"""
+        if not self._bus:
+            return
+        correlation_id = new_msg_id()
+        names = "、".join(p.get("name", "") for p in missing_params)
+        task = self._current_task or {}
+        payload = {
+            "request_type": "missing_param",
+            "tool_name": action.get("tool_name", action.get("action_name", "")),
+            "action_name": action.get("action_name", ""),
+            "goal": action.get("goal", ""),
+            "missing_params": missing_params,
+            "action": action,
+            "task_id": task.get("task_id", ""),
+        }
+        try:
+            await self._send_message(
+                COORDINATOR_ID, "request",
+                f"{self.agent_id} 执行动作 {action.get('action_name', '')} 缺少参数：{names}，请求指挥解决",
+                payload=payload,
+                correlation_id=correlation_id,
+            )
+        except Exception as e:
+            sys.stderr.write(f"[SubAgent {self.agent_id}] 缺参请求失败: {e}\n")
+            sys.stderr.flush()
+            self.status = "error"
+            self.error = f"缺参请求失败: {e}"
+            return
+
+        self._awaiting_reply = correlation_id
+        self._pending_resolution = {
+            "action": action,
+            "step_idx": self.state.get("current_step_idx", 0),
+            "missing_params": missing_params,
+        }
+        self.state["pending_question"] = ""
+        self.status = "running"
+        self.last_output = f"缺少参数 {names}，已向指挥请求解决..."
+        self.state["output"] = self.last_output
+        sys.stderr.write(f"[SubAgent {self.agent_id}] 缺参请求已发送，挂起等待指挥回复\n")
+        sys.stderr.flush()
+
+    async def _handle_command_reply(self, msg: dict):
+        """处理指挥的同步回复：解析结构化 payload（algorithm / param_value）"""
+        payload = msg.get("payload") or {}
+        kind = payload.get("kind")
+        content = msg.get("content", "")
+        sys.stderr.write(f"[SubAgent {self.agent_id}] 收到指挥回复 kind={kind}: {content[:100]}\n")
+        sys.stderr.flush()
+        if kind == "algorithm":
+            action = payload.get("action")
+            if action:
+                idx = self.state.get("current_step_idx", 0)
+                actions = self.state.get("detail_actions", [])
+                actions.insert(idx, action)
+                self.state["detail_actions"] = actions
+                self.last_output = f"已按指挥指示插入算法动作: {action.get('action_name', '')}"
+                self.state["output"] = self.last_output
+                sys.stderr.write(f"[SubAgent {self.agent_id}] 已插入动作: {action.get('action_name', '')}\n")
+                sys.stderr.flush()
+            self.state["pending_question"] = ""
+        elif kind == "param_value":
+            values = payload.get("values") or {}
+            if self._pending_resolution:
+                # 注入到当前挂起动作的 tool_inputs
+                action = self._pending_resolution.get("action", {})
+                action.setdefault("tool_inputs", {})
+                for k, v in values.items():
+                    action["tool_inputs"][k] = v
+                self._pending_param_values = dict(values)
+                # 同步回 detail_actions 以便后续重试仍保留
+                idx = self._pending_resolution.get("step_idx", 0)
+                actions = self.state.get("detail_actions", [])
+                if 0 <= idx < len(actions):
+                    actions[idx]["tool_inputs"] = action.get("tool_inputs", {})
+                self._pending_resolution = None
+            self.last_output = f"已收到指挥提供的参数值: {values}"
+            self.state["output"] = self.last_output
+            self.state["pending_question"] = ""
+        else:
+            self.state["messages"].append(SystemMessage(content=f"[指挥回复] {content}"))
+            if content and not self.state.get("pending_question"):
+                self.state["pending_question"] = ""
 
     async def _report_analysis_to_coordinator(self):
         """分析完成后：把分析结论发给指挥，由指挥提取并写 Redis（补 analysis_result 缺口）"""
@@ -565,6 +735,10 @@ class SubAgent:
         self.error = None
         self._current_task = None
         self._awaiting_reply = None
+        self._reported_macro_plan = False
+        self._reported_detail_plan = False
+        self._pending_resolution = None
+        self._pending_param_values = None
         
         # 保存重置后的状态到 Redis
         if self.redis_mgr:

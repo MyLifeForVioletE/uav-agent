@@ -1,0 +1,1 @@
+[UAV_1 步骤 1/8] 规划航线 | path_planning(startPosition=70,15, destination=70,15.01, map=c:\Users\EHz\Desktop\uavAgentPlanning\knowledge\LAYERDESCRIPTIONFILE.LDF, bilndArea=c:\Users\EHz\Desktop\uavAgentPlanning\knowledge\blind.txt, CoverageArea=c:\Users\EHz\Desktop\uavAgentPlanning\knowledge\clear.txt)

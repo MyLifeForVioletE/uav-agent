@@ -75,6 +75,9 @@ class AgentState(TypedDict, total=False):
     _dispatch_count: int              # dispatcher 调用计数（防死循环）
     _current_task_idx: int            # 当前正在执行的子任务索引（fleet_dispatcher 使用）
     _last_collected_input: str        # parameter_collector 记录的上次用户输入（防重复处理）
+    recorded_plans: dict              # 指挥记录的 UAV 宏观/详细规划 {agent_id: {...}}
+    _awaiting_user_param: dict        # 指挥等待用户提供缺失参数的状态 {agent_id, task_id, params, correlation_id}
+    _param_resolve_attempts: dict     # 缺参推导尝试计数 {agent_key: int} 防循环
 
     # --- 单机图内部状态 ---
     _has_input: bool                  # idle 节点标记：本轮是否有新输入
@@ -132,6 +135,9 @@ def default_agent_state() -> AgentState:
         "_dispatch_count": 0,
         "_current_task_idx": 0,
         "_last_collected_input": "",
+        "recorded_plans": {},
+        "_awaiting_user_param": {},
+        "_param_resolve_attempts": {},
         "_has_input": False,
         "_last_input": "",
     }

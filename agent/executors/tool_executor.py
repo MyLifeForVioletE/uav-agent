@@ -2,6 +2,7 @@
 工具执行器：执行算法工具调用
 包含参数查找逻辑：Redis缓存 → knowledge目录扫描 → LLM选择 → 询问用户
 """
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -13,6 +14,148 @@ from core.redis_manager import get_redis_manager
 
 # knowledge 目录支持的文件类型
 KNOWLEDGE_EXTENSIONS = {".txt", ".json", ".ldf"}
+
+# LLM 单次调用超时（秒）：Ollama 无响应/排队时兜底，避免永久挂起
+LLM_CALL_TIMEOUT = 60.0
+
+
+async def _ainvoke_with_timeout(llm, prompt, timeout: float = LLM_CALL_TIMEOUT):
+    """
+    带超时的 LLM 调用：超时抛出 TimeoutError，由调用方决定降级策略。
+    返回 LLM 响应的 content 字符串。
+    """
+    from langchain_core.messages import HumanMessage
+    response = await asyncio.wait_for(
+        llm.ainvoke([HumanMessage(content=prompt)]),
+        timeout=timeout,
+    )
+    return response.content.strip()
+
+
+def _is_coord_param(param_name: str, param_desc: str, param_type: str) -> bool:
+    """判断参数是否为坐标类（名/描述含坐标词，或类型为 tuple 坐标、format=comma/space）"""
+    text = f"{param_name} {param_desc}".lower()
+    if param_type == "tuple":
+        return True
+    if any(k in text for k in ("坐标", "位置", "经纬度", "longitude", "latitude", "coord", "x,y", "x、y")):
+        return True
+    return False
+
+
+def _group_to_coord_str(group) -> Optional[str]:
+    """把单个分组（dict 或 dict 列表）中的 Longitude/Latitude 拼成 x,y 坐标；找不到返回 None"""
+    if not isinstance(group, list):
+        group = [group]
+    for item in group:
+        if not isinstance(item, dict):
+            continue
+        lon = (item.get("Longitude") or item.get("longitude")
+               or item.get("lon") or item.get("Lon") or item.get("x"))
+        lat = (item.get("Latitude") or item.get("latitude")
+               or item.get("lat") or item.get("Lat") or item.get("y"))
+        if lon is not None and lat is not None and str(lon).strip() and str(lat).strip():
+            return f"{lon},{lat}"
+    return None
+
+
+def _local_resolve_param(context: dict, param_name: str, param_desc: str, param_type: str) -> Optional[str]:
+    """
+    LLM 不可用/超时后的本地降级：键值直取 → 语义启发式 → 坐标按分组拼接。
+    返回候选值字符串（坐标转为 x,y 形式），找不到返回 None。
+    """
+    if not context:
+        return None
+
+    def to_coord_str(v):
+        s = str(v).strip()
+        if s.startswith("{"):
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    lon = (obj.get("Longitude") or obj.get("longitude")
+                           or obj.get("lon") or obj.get("Lon") or obj.get("x"))
+                    lat = (obj.get("Latitude") or obj.get("latitude")
+                           or obj.get("lat") or obj.get("Lat") or obj.get("y"))
+                    if lon is not None and lat is not None:
+                        return f"{lon},{lat}"
+            except Exception:
+                pass
+        return s
+
+    pname_lower = param_name.lower()
+
+    is_coord = _is_coord_param(param_name, param_desc, param_type)
+
+    # 1) 键名直取：上下文各分组里与参数名完全同名的字段
+    for group in context.values():
+        if not isinstance(group, list):
+            group = [group]
+        for item in group:
+            if not isinstance(item, dict):
+                continue
+            for k, v in item.items():
+                if str(k).lower() == pname_lower and str(v).strip():
+                    return to_coord_str(v)
+
+    # 2) 坐标参数：按语义分组拼接 Longitude/Latitude（起点→uav/base 分组；终点→target/base 分组）
+    desc_lower = (param_desc or "").lower()
+    is_start = any(k in pname_lower or k in desc_lower for k in ("start", "起点", "from", "当前位置", "开始", "uav", "outpoint"))
+    is_end = any(k in pname_lower or k in desc_lower for k in ("dest", "终点", "目标", "target", "end", "to"))
+    if is_coord:
+        if is_end:
+            end_candidates = []
+            target_g = context.get("targets")
+            base_g = context.get("base")
+            for g in (target_g, base_g):
+                if g:
+                    c = _group_to_coord_str(g)
+                    if c:
+                        end_candidates.append(c)
+            # 终点优先 target；无法区分时返回第一个候选，否则返回 None 交给更上层
+            if end_candidates:
+                return end_candidates[0]
+        # 起点：UAV 分组优先，其次 base
+        for gname in ("uavs", "uav", "base"):
+            g = context.get(gname)
+            if g:
+                c = _group_to_coord_str(g)
+                if c:
+                    return c
+        # 兜底：任一分组含 kind = "start" 类坐标
+        for gname, g in context.items():
+            if any(k in str(gname).lower() for k in ("start", "uav", "pos", "航")):
+                c = _group_to_coord_str(g)
+                if c:
+                    return c
+
+    # 3) 语义启发式：按参数含义匹配单个键
+    aliases = {
+        "start": ["start", "起点", "startposition", "start_position", "uavposition", "uav_position", "当前位置", "uav", "from"],
+        "end": ["end", "终点", "endposition", "end_position", "targetposition", "target_position", "目标", "target", "base", "baseposition"],
+        "frequency": ["frequency", "频率", "freq", "target_frequency"],
+        "bandwidth": ["bandwidth", "带宽", "bw"],
+        "signal": ["signal_strength", "信号强度", "signal", "场强"],
+        "power": ["power", "功率", "w", "dbm"],
+    }
+    for kind, keys in aliases.items():
+        matched = False
+        if pname_lower in keys:
+            matched = True
+        if any(k in desc_lower for k in keys):
+            matched = True
+        if not matched:
+            continue
+        for group in context.values():
+            if not isinstance(group, list):
+                group = [group]
+            for item in group:
+                if not isinstance(item, dict):
+                    continue
+                for k, v in item.items():
+                    if str(k).lower() in keys and str(v).strip():
+                        return to_coord_str(v)
+
+    return None
 
 
 def _load_algorithms():
@@ -105,7 +248,36 @@ def _normalize_param_value(value: str, param_type: str, param_format: str = "") 
         nums = re.findall(r"-?\d+\.?\d*", v)
         if len(nums) >= 2:
             return f"{nums[0]},{nums[1]}"
+    # 数值型参数带频率单位（GHz/MHz/kHz/Hz）时，统一换算为 MHz（与算法 exe 约定单位一致）
+    if param_type == "number":
+        converted = _convert_frequency_to_mhz(v)
+        if converted is not None:
+            return converted
     return value
+
+
+def _convert_frequency_to_mhz(value: str):
+    """将带单位频率字符串换算为 MHz 数值字符串；纯数字视为已是 MHz 返回；未知单位返回 None"""
+    import re
+    s = value.strip()
+    m = re.match(r"^(-?\d+(?:\.\d+)?)\s*([A-Za-z]+)?$", s)
+    if not m:
+        return None
+    num = float(m.group(1))
+    unit = (m.group(2) or "").lower()
+    if unit in ("ghz", "g"):
+        mhz = num * 1000
+    elif unit in ("mhz", "m"):
+        mhz = num
+    elif unit in ("khz", "kh", "k"):
+        mhz = num / 1000.0
+    elif unit in ("hz", "h"):
+        mhz = num / 1000000.0
+    elif unit == "":
+        return s  # 纯数字，按约定视为 MHz
+    else:
+        return None  # 未知单位（如 W/dBm），不强行换算
+    return str(int(mhz)) if mhz == int(mhz) else str(mhz)
 
 
 def _build_file_list_text(files: list[dict]) -> str:
@@ -144,9 +316,9 @@ async def _llm_select_file(llm, files: list[dict], scene_description: str,
 
     try:
         from langchain_core.messages import HumanMessage
-        response = await llm.ainvoke([HumanMessage(content=prompt)])
-        selected = response.content.strip()
-        
+        response = await _ainvoke_with_timeout(llm, prompt)
+        selected = response.strip()
+
         # 验证选择
         if selected == "NONE" or not selected:
             return None
@@ -161,6 +333,10 @@ async def _llm_select_file(llm, files: list[dict], scene_description: str,
             if selected in f["name"] or f["name"] in selected:
                 return f["path"]
         
+        return None
+    except asyncio.TimeoutError:
+        sys.stderr.write(f"[ToolExecutor] LLM选择文件超时({LLM_CALL_TIMEOUT}s)，降级为无选定文件: {param_name}\n")
+        sys.stderr.flush()
         return None
     except Exception as e:
         sys.stderr.write(f"[ToolExecutor] LLM选择文件失败: {e}\n")
@@ -209,8 +385,8 @@ async def _llm_extract_value_from_file(llm, file_path: str, file_ext: str,
 
     try:
         from langchain_core.messages import HumanMessage
-        response = await llm.ainvoke([HumanMessage(content=prompt)])
-        value = response.content.strip()
+        response = await _ainvoke_with_timeout(llm, prompt)
+        value = response.strip()
 
         if value == "NONE" or not value:
             return None
@@ -218,6 +394,10 @@ async def _llm_extract_value_from_file(llm, file_path: str, file_ext: str,
         # 去除可能的引号包裹
         value = value.strip('"').strip("'")
         return value
+    except asyncio.TimeoutError:
+        sys.stderr.write(f"[ToolExecutor] LLM文件取值超时({LLM_CALL_TIMEOUT}s): {param_name}\n")
+        sys.stderr.flush()
+        return None
     except Exception as e:
         sys.stderr.write(f"[ToolExecutor] LLM提取值失败: {e}\n")
         sys.stderr.flush()
@@ -253,13 +433,14 @@ async def _llm_extract_from_context(llm, param_name: str, param_desc: str,
 - 参数类型: {param_type}
 
 请从上下文中找到与该参数语义最匹配的值，只返回值本身（不要参数名、不要引号、不要其他内容）。
+如果上下文中的值是带单位的频率（如 GHz/MHz/kHz），必须**保留单位**返回（如 "2GHz"），禁止去掉单位。
 例如 goal 说"从起始点到目标位置1"，那么 uavPosition 应该返回起始点坐标，targetPosition 应该返回目标位置1坐标。
 如果没有找到匹配的值，返回 "NONE"。"""
 
     try:
         from langchain_core.messages import HumanMessage
-        response = await llm.ainvoke([HumanMessage(content=prompt)])
-        result = response.content.strip()
+        response = await _ainvoke_with_timeout(llm, prompt)
+        result = response.strip()
         
         sys.stderr.write(f"[ToolExecutor] LLM提取结果: '{result}'\n")
         sys.stderr.flush()
@@ -268,6 +449,10 @@ async def _llm_extract_from_context(llm, param_name: str, param_desc: str,
             return None
         
         return result
+    except asyncio.TimeoutError:
+        sys.stderr.write(f"[ToolExecutor] LLM上下文提取超时({LLM_CALL_TIMEOUT}s): {param_name}，尝试本地降级\n")
+        sys.stderr.flush()
+        return None
     except Exception as e:
         sys.stderr.write(f"[ToolExecutor] LLM提取失败: {e}\n")
         sys.stderr.flush()
@@ -385,7 +570,14 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
                     tool_inputs[param_name] = extracted_value
                     continue
                 else:
-                    sys.stderr.write(f"[ToolExecutor] LLM提取失败: {param_name}\n")
+                    # LLM 超时/失败/返回 NONE → 本地降级（键值直取 + 语义启发式），仍缺才进入 missing_params
+                    local_value = _local_resolve_param(context, param_name, param_desc, param_type)
+                    if local_value:
+                        sys.stderr.write(f"[ToolExecutor] LLM提取失败，本地降级补齐: {param_name}={local_value}\n")
+                        sys.stderr.flush()
+                        tool_inputs[param_name] = local_value
+                        continue
+                    sys.stderr.write(f"[ToolExecutor] LLM提取失败且本地无法补齐: {param_name}\n")
                     sys.stderr.flush()
             elif not context:
                 sys.stderr.write(f"[ToolExecutor] 无结构化上下文\n")
@@ -408,10 +600,19 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
             names = "、".join(f"{p}({input_schema[p].get('description', p)})" for p in missing)
             sys.stderr.write(f"[ToolExecutor] 缺少必需参数: {names}\n")
             sys.stderr.flush()
+            missing_params = [
+                {
+                    "name": p,
+                    "description": input_schema[p].get("description", p),
+                    "type": input_schema[p].get("type", "string"),
+                }
+                for p in missing
+            ]
             return {
                 "success": False,
                 "output": "",
                 "error": f"缺少必需参数: {names}",
+                "missing_params": missing_params,
                 "pending": False,
             }
 

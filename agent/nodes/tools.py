@@ -67,7 +67,15 @@ async def execute_tools(state: AgentState, deps: Deps) -> AgentState:
 
             # 分发执行
             result = await dispatch_executor(action, context)
-            
+
+            # 缺少参数：不推进索引、不置错误，交由 SubAgent 缺参请求路径处理
+            if result.get("missing_params"):
+                missing = "、".join(p.get("name", p) for p in result["missing_params"])
+                state["output"] = f"动作 {action.get('action_name', '')} 缺少参数: {missing}，将请求指挥解决"
+                state["pending_question"] = ""
+                sys.stderr.write(f"[Execute] 缺参: {missing}\n"); sys.stderr.flush()
+                return state
+
             # 执行成功后应用 post_action_update
             if action.get("post_action_update"):
                 _apply_post_action_update(state, action, result)

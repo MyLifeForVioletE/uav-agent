@@ -562,16 +562,20 @@ async def fleet_dispatcher_node(state: AgentState, deps: Deps) -> AgentState:
     
     # 如果子agent在等待用户确认，注入用户输入
     if state.get("_sub_awaiting") and state.get("user_input"):
-        task_id = state["_sub_awaiting"]
-        agent_id = fleet_mgr.task_to_agent.get(task_id)
-        if agent_id:
-            if agent_id == FleetManager._INFO_PROCESSOR_ID:
-                fleet_mgr._info_processor_agent.inject_user_input(state["user_input"])
-            else:
-                agent = fleet_mgr.sub_agents.get(agent_id)
-                if agent:
-                    agent.inject_user_input(state["user_input"])
-            state["_sub_awaiting"] = ""
+        # 用户在回答指挥的缺参问题 → 指挥提取值并回发无人机，不注入子agent
+        if state.get("_awaiting_user_param"):
+            await fleet_mgr._handle_user_param_answer(state, state["user_input"])
+        else:
+            task_id = state["_sub_awaiting"]
+            agent_id = fleet_mgr.task_to_agent.get(task_id)
+            if agent_id:
+                if agent_id == FleetManager._INFO_PROCESSOR_ID:
+                    fleet_mgr._info_processor_agent.inject_user_input(state["user_input"])
+                else:
+                    agent = fleet_mgr.sub_agents.get(agent_id)
+                    if agent:
+                        agent.inject_user_input(state["user_input"])
+                state["_sub_awaiting"] = ""
     
     # 推进一步
     await fleet_mgr.tick(state)

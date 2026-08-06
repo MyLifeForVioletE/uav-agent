@@ -9,10 +9,34 @@ from pathlib import Path
 from typing import Dict
 from core.state import AgentState, Deps
 from core.redis_manager import RedisManager
-from core.config import BASE_DIR
+from core.config import BASE_DIR, COORDINATOR_ID
 from core.kafka_bus import get_kafka_bus
 from agent.sub_agent import SubAgent
 from .state_sync import StateSync
+
+
+def _load_algorithm_list_text() -> str:
+    """从 algorithms.json 加载全部算法（含输入/输出 schema），供指挥缺参推导时参考"""
+    path = BASE_DIR / "algorithms.json"
+    if not path.is_file():
+        return ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return ""
+    lines = []
+    for cap in data.get("capabilities", []):
+        name = cap.get("name", "")
+        desc = cap.get("description", "")
+        params = ", ".join(f"{k}({v.get('type', '')}: {v.get('description', '')})" for k, v in cap.get("input_schema", {}).items())
+        outputs = ", ".join(f"{k}({v.get('description', k)})" if isinstance(v, dict) else str(v) for k, v in cap.get("output_schema", {}).items())
+        lines.append(
+            f"- {name}：{desc}\n"
+            f"  输入: {params or '无'}\n"
+            f"  输出: {outputs or '无'}"
+        )
+    return "\n".join(lines)
 
 
 class FleetManager:
@@ -98,6 +122,7 @@ class FleetManager:
                 await self._handle_agent_result(state, m)
             elif mtype in ("report",):
                 await self._archive_report(state, m)
+                await self._record_plan_report(state, m)
                 sys.stderr.write(f"[Fleet] 指挥收到 {from_id} 上报({mtype}): {content[:120]}\n")
                 sys.stderr.flush()
             elif mtype == "request":
@@ -135,6 +160,240 @@ class FleetManager:
                 self.redis_mgr.update_context(state["session_id"], {"targets": [{"analysis_result": result}]})
             except Exception:
                 pass
+
+    async def _record_plan_report(self, state: AgentState, msg: dict):
+        """指挥记录 UAV 上报的宏观/详细规划 + 当前执行动作（落 Redis + state）"""
+        payload = msg.get("payload") or {}
+        report_type = payload.get("report_type", "")
+        from_id = msg.get("from", "")
+        session_id = state.get("session_id", "default")
+
+        state.setdefault("recorded_plans", {}).setdefault(from_id, {})
+        entry = state["recorded_plans"][from_id]
+
+        if report_type == "macro_plan":
+            entry["macro_plan"] = payload.get("macro_phases", [])
+        elif report_type == "detail_plan":
+            entry["detail_plan"] = payload.get("detail_actions", [])
+        elif report_type in ("action_start", "action_executed"):
+            log = entry.setdefault("execution_log", [])
+            log.append({
+                "step_idx": payload.get("step_idx", 0),
+                "total": payload.get("total", 0),
+                "action": payload.get("action", {}),
+                "success": payload.get("success"),
+            })
+            if report_type == "action_executed":
+                self._write_action_script_line(state, msg)
+
+        if self.redis_mgr:
+            try:
+                self.redis_mgr.set(f"plans:{session_id}", state.get("recorded_plans", {}), expire=86400)
+            except Exception as e:
+                sys.stderr.write(f"[Fleet] 规划记录落 Redis 失败: {e}\n")
+                sys.stderr.flush()
+
+    def _script_path(self, session_id: str, seg: int) -> str:
+        out_dir = BASE_DIR / "output"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / f"actions_script_{session_id}_part{seg}.txt"
+
+    def _next_script_seg(self, session_id: str) -> int:
+        """根据已存在的 part 文件个数推导下一个段号（不依赖内存 state，跨 tick/重启安全）"""
+        out_dir = BASE_DIR / "output"
+        try:
+            if out_dir.is_dir():
+                existing = [p for p in out_dir.glob(f"actions_script_{session_id}_part*.txt")]
+                return len(existing) + 1
+        except Exception:
+            pass
+        return 1
+
+    def _finalize_script_segment(self, state: AgentState, reason: str = ""):
+        """结束当前脚本段：在最新段文件写入结束标记（下次写入自然开新段文件）"""
+        session_id = state.get("session_id", "default")
+        seg = self._next_script_seg(session_id)
+        try:
+            script_path = self._script_path(session_id, seg)
+            with open(script_path, "a", encoding="utf-8") as f:
+                f.write(f"# === 段结束 === {reason}\n" if reason else "# === 段结束 ===\n")
+            sys.stderr.write(f"[Fleet] 脚本段 {seg} 结束({reason}): {script_path}\n")
+            sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f"[Fleet] 脚本段结束标记写入失败: {e}\n")
+            sys.stderr.flush()
+
+    def _write_action_script_line(self, state: AgentState, msg: dict):
+        """把已执行的动作 + 实际调用参数值写入脚本文件（txt，每行一个动作）"""
+        payload = msg.get("payload") or {}
+        from_id = msg.get("from", "")
+        session_id = state.get("session_id", "default")
+        action = payload.get("action", {}) or {}
+        step_idx = payload.get("step_idx", 0)
+        total = payload.get("total", 0)
+
+        action_name = action.get("action_name", "")
+        tool_name = action.get("tool_name", action.get("action_name", ""))
+        tool_inputs = action.get("tool_inputs", {}) or {}
+        params = ", ".join(f"{k}={v}" for k, v in tool_inputs.items() if str(v).strip())
+
+        line = f"[{from_id} 步骤 {step_idx+1}/{total}] {action_name}"
+        if tool_name and params:
+            line += f" | {tool_name}({params})"
+        elif tool_name:
+            line += f" | {tool_name}"
+
+        try:
+            seg = self._next_script_seg(session_id)
+            script_path = self._script_path(session_id, seg)
+            with open(script_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            sys.stderr.write(f"[Fleet] 已写入脚本文件: {script_path} :: {line}\n")
+            sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f"[Fleet] 脚本文件写入失败: {e}\n")
+            sys.stderr.flush()
+
+    async def _handle_coordinator_request(self, state: AgentState, msg: dict):
+        """子 agent 请示：缺参请求走专项处理；其余交指挥 LLM 决策"""
+        payload = msg.get("payload") or {}
+        if payload.get("request_type") == "missing_param":
+            await self._handle_missing_param_request(state, msg)
+            return
+        await self._handle_generic_request(state, msg)
+
+    async def _handle_missing_param_request(self, state: AgentState, msg: dict):
+        """缺参请示：指挥先从算法库判断能否用现有信息推导，不能则询问用户"""
+        payload = msg.get("payload") or {}
+        from_id = msg.get("from", "")
+        session_id = state.get("session_id", "default")
+        missing = payload.get("missing_params", [])
+        tool_name = payload.get("tool_name", "")
+        goal = payload.get("goal", "")
+        task_id = payload.get("task_id", "")
+        correlation_id = msg.get("correlation_id")
+
+        if not missing:
+            await self._send_reply(state, from_id, "缺参信息为空，请重试。", correlation_id)
+            return
+
+        # 防循环：同一 agent+动作 的推导尝试上限
+        attempts_key = f"{from_id}:{tool_name}:{payload.get('action_name', '')}"
+        attempts = state.setdefault("_param_resolve_attempts", {})
+        count = attempts.get(attempts_key, 0)
+        attempts[attempts_key] = count + 1
+        force_ask_user = count >= 3
+
+        llm = self.deps.llm_no_tools if self.deps else None
+        ctx = {}
+        if self.redis_mgr:
+            try:
+                ctx = self.redis_mgr.get_context(session_id) or {}
+            except Exception:
+                ctx = {}
+
+        if llm and not force_ask_user:
+            decision = await self._derive_param_via_algorithm(state, msg, missing, ctx)
+            algo_name = decision.get("algorithm")
+            if decision.get("derivable") and algo_name:
+                action = {
+                    "executor": "tool",
+                    "tool_name": algo_name,
+                    "tool_inputs": decision.get("tool_inputs", {}) or {},
+                    "action_name": decision.get("action_name") or f"调用{algo_name}计算缺失参数",
+                    "goal": decision.get("goal") or f"为 {tool_name} 计算缺失参数",
+                }
+                # 指挥记录：插入的算法动作
+                state.setdefault("recorded_plans", {}).setdefault(from_id, {}).setdefault("inserted_actions", []).append(action)
+                if self.redis_mgr:
+                    try:
+                        self.redis_mgr.set(f"plans:{session_id}", state.get("recorded_plans", {}), expire=86400)
+                    except Exception:
+                        pass
+                sys.stderr.write(f"[Fleet] 缺参推导成功: {tool_name} 缺 {[p.get('name') for p in missing]} → 用 {algo_name}\n")
+                sys.stderr.flush()
+                await self._send_reply(state, from_id,
+                    f"指挥已推导：调用算法 {algo_name} 计算缺失参数，动作已加入执行列表。",
+                    correlation_id,
+                    payload={"kind": "algorithm", "action": action})
+                return
+
+        # 推导失败/无 LLM/超限 → 询问用户：先结束当前脚本段，恢复后另起新段
+        param_desc = "、".join(f"{p.get('name', '')}({p.get('description', '')})" for p in missing)
+        self._finalize_script_segment(state, f"缺参暂停：{tool_name} 需要 {param_desc}，等待用户提供")
+        state["_awaiting_user_param"] = {
+            "agent_id": from_id,
+            "task_id": task_id,
+            "tool_name": tool_name,
+            "params": missing,
+            "correlation_id": correlation_id,
+        }
+        state["_sub_awaiting"] = task_id
+        question = (f"无人机 {from_id} 执行动作「{payload.get('action_name', '')}」需要参数 {param_desc}，"
+                    f"指挥无法从现有信息推导。\n请提供该参数的值（如坐标格式 70,15.01）。")
+        state["pending_question"] = question
+        state["output"] = question
+        sys.stderr.write(f"[Fleet] 缺参推导失败/超限，询问用户: {question[:120]}\n")
+        sys.stderr.flush()
+
+    async def _derive_param_via_algorithm(self, state: AgentState, msg: dict, missing: list, ctx: dict) -> dict:
+        """指挥 LLM：判断能否用现有信息调用某算法得到缺失参数"""
+        llm = self.deps.llm_no_tools if self.deps else None
+        if not llm:
+            return {"derivable": False}
+        payload = msg.get("payload") or {}
+        from_id = msg.get("from", "")
+        tool_name = payload.get("tool_name", "")
+        goal = payload.get("goal", "")
+        action = payload.get("action", {})
+        known_inputs = action.get("tool_inputs", {}) if isinstance(action, dict) else {}
+
+        algo_text = _load_algorithm_list_text()
+        missing_text = json.dumps(missing, ensure_ascii=False)
+        known_text = json.dumps(known_inputs, ensure_ascii=False)
+        ctx_text = json.dumps(ctx, ensure_ascii=False)
+
+        prompt = (
+            "你是多无人机电磁侦察任务的指挥 agent。无人机 agent 调用算法工具时缺少参数，"
+            "请你判断能否用【当前已掌握的现有信息】调用【算法库中的某个算法】直接算出缺失参数。\n\n"
+            f"【缺参者】{from_id}\n"
+            f"【目标工具】{tool_name}\n"
+            f"【动作目标】{goal}\n"
+            f"【缺失参数】{missing_text}\n"
+            f"【该动作已明确的参数】{known_text}\n\n"
+            f"【算法库】\n{algo_text}\n\n"
+            f"【当前共享上下文（已有信息）】\n{ctx_text}\n\n"
+            "【判断规则】\n"
+            "1. 只有当选中的算法能产出缺失参数（语义匹配，如路径规划的起点/终点可产出坐标类参数），"
+            "且该算法每个输入参数都能从现有上下文或已知参数中得到明确值时，derivable 才为 true。\n"
+            "2. 缺失参数可能是选中的算法的输入参数，也可能是其输出。选择能算出该参数的最短链路。\n"
+            "3. 禁止编造数值。任何参数拿不到明确值就 derivable=false。\n"
+            "4. 若缺失参数是 file 类型（如参数文件），可选用生成该文件的算法；无法生成则 derivable=false。\n\n"
+            "只输出 JSON：\n"
+            '{"derivable": true/false, "algorithm": "算法名或空", "tool_inputs": {算法输入参数: 值}, '
+            '"action_name": "人类可读动作名", "goal": "该动作要算出什么参数", "reason": "简短理由"}'
+        )
+        try:
+            from langchain_core.messages import HumanMessage
+            response = await llm.ainvoke([HumanMessage(content=prompt)])
+            raw = str(response.content).strip()
+        except Exception as e:
+            sys.stderr.write(f"[Fleet] 缺参推导调用失败: {e}\n")
+            sys.stderr.flush()
+            return {"derivable": False}
+        import re as _re
+        try:
+            m = _re.search(r"\{.*\}", raw, _re.DOTALL)
+            if not m:
+                return {"derivable": False}
+            decision = json.loads(m.group())
+            if not isinstance(decision, dict):
+                return {"derivable": False}
+            return decision
+        except Exception as e:
+            sys.stderr.write(f"[Fleet] 缺参推导解析失败: {raw[:200]}\n")
+            sys.stderr.flush()
+            return {"derivable": False}
 
     async def _handle_agent_result(self, state: AgentState, msg: dict):
         """子 agent 算法/分析结果：指挥 LLM 从原始输出提取字段，更新 Redis 上下文 + 归档 shared_results"""
@@ -267,7 +526,7 @@ class FleetManager:
         sys.stderr.write(f"[Fleet] 指挥更新上下文: {json.dumps(nested, ensure_ascii=False)}\n")
         sys.stderr.flush()
 
-    async def _handle_coordinator_request(self, state: AgentState, msg: dict):
+    async def _handle_generic_request(self, state: AgentState, msg: dict):
         """子 agent 请示：交指挥 LLM 决策，生成 reply（可附带向其它 agent 下发的指令）"""
         llm = self.deps.llm_no_tools if self.deps else None
         if not llm:
@@ -342,6 +601,164 @@ class FleetManager:
             session_id = (state or {}).get("session_id", "default")
             await self._bus.send(self._COORD_ID, to_agent_id, "instruction", content,
                                  payload={"session_id": session_id})
+
+    async def _send_reply(self, state: AgentState, to_agent_id: str, content: str,
+                          correlation_id: str = None, payload: dict = None):
+        """指挥向子 agent 发送 reply（带 correlation_id 配对 request/reply）+ 可选结构化 payload"""
+        if not self._bus:
+            return
+        session_id = state.get("session_id", "default")
+        reply_payload = dict(payload or {})
+        reply_payload.setdefault("session_id", session_id)
+        await self._bus.send(self._COORD_ID, to_agent_id, "reply", content,
+                             correlation_id=correlation_id, payload=reply_payload)
+        sys.stderr.write(f"[Fleet] 指挥回复 {to_agent_id}: {content[:120]}\n")
+        sys.stderr.flush()
+
+    async def _handle_user_param_answer(self, state: AgentState, user_input: str):
+        """用户回答了指挥的缺参问题：LLM 提取参数值 → 回发 reply 给无人机 → 清理等待状态"""
+        info = state.get("_awaiting_user_param") or {}
+        agent_id = info.get("agent_id", "")
+        correlation_id = info.get("correlation_id")
+        params = info.get("params", [])
+        llm = self.deps.llm_no_tools if self.deps else None
+        values = {}
+
+        if llm and params and user_input.strip():
+            missing_text = json.dumps(params, ensure_ascii=False)
+            prompt = (
+                "你是多无人机电磁侦察任务的指挥 agent。用户回答了你关于缺失参数的问题，"
+                "请从用户的回答中提取各参数的值。\n\n"
+                f"【缺失参数】{missing_text}\n"
+                f"【用户回答】{user_input}\n\n"
+                "【关键规则】\n"
+                "1. 数值型参数（如频率、带宽、功率）必须**保留原始值及其单位**，禁止剥离单位、禁止丢失单位。"
+                "例如用户回答 \"2GHz\" 应提取为 \"2GHz\"（值与单位一起保留），而不是 2。\n"
+                "2. 单位为 GHz/MHz/kHz/Hz/dBm/W 等时，作为字符串保留（如 \"2GHz\" 或 \"3MHz\"）。\n"
+                "3. 坐标参数仍用 x,y 格式。\n\n"
+                "只输出 JSON 对象，key 为参数名，value 为保留单位的值字符串。"
+                "若某个参数无法从回答中得到明确值，则不输出该 key。"
+                "若全部无法提取，输出 {}。"
+            )
+            try:
+                from langchain_core.messages import HumanMessage
+                response = await llm.ainvoke([HumanMessage(content=prompt)])
+                raw = str(response.content).strip()
+                import re as _re
+                m = _re.search(r"\{.*\}", raw, _re.DOTALL)
+                if m:
+                    parsed = json.loads(m.group())
+                    if isinstance(parsed, dict):
+                        values = parsed
+            except Exception as e:
+                sys.stderr.write(f"[Fleet] 参数提取失败: {e}\n")
+                sys.stderr.flush()
+
+        # 兜底：单个缺参且用户输入可能即值
+        if not values and len(params) == 1 and user_input.strip():
+            values[params[0].get("name")] = user_input.strip()
+
+        sys.stderr.write(f"[Fleet] 用户提供的参数值: {values}\n")
+        sys.stderr.flush()
+
+        # 指挥将用户提供的参数同步到 Redis 上下文（黑板共享，供后续任务使用）
+        if values and self.redis_mgr:
+            try:
+                await self._update_context_from_user_params(state, values, info)
+            except Exception as e:
+                sys.stderr.write(f"[Fleet] 用户参数写 Redis 失败: {e}\n")
+                sys.stderr.flush()
+
+        if self._bus:
+            await self._send_reply(
+                state, agent_id,
+                f"指挥已收到你所需参数：{json.dumps(values, ensure_ascii=False)}" if values else f"参数仍未确定，请重试：{user_input}",
+                correlation_id,
+                payload={"kind": "param_value", "values": values},
+            )
+
+        state["_awaiting_user_param"] = {}
+        state["_sub_awaiting"] = ""
+        state["user_input"] = ""
+
+    async def _update_context_from_user_params(self, state: AgentState, values: dict, info: dict):
+        """指挥把用户提供的缺失参数值映射到 Redis 上下文（黑板共享）"""
+        llm = self.deps.llm_no_tools if self.deps else None
+        if not llm:
+            return
+        session_id = state.get("session_id", "default")
+        current_context = self.redis_mgr.get_context(session_id) or {}
+
+        # 获取目标工具的输入/输出定义，帮助 LLM 语义映射
+        tool_params = ""
+        try:
+            with open(BASE_DIR / "algorithms.json", encoding="utf-8") as f:
+                algos = {a["name"]: a for a in json.load(f).get("capabilities", [])}
+            schema = algos.get(info.get("tool_name", ""), {}).get("output_schema", {})
+            if schema:
+                lines = ["【目标工具输出定义】"]
+                for pname, pinfo in schema.items():
+                    lines.append(f"- {pname}: {pinfo.get('description', pname)}")
+                tool_params = "\n".join(lines) + "\n\n"
+        except Exception:
+            pass
+
+        prompt_parts = [
+            "你是一个多无人机任务系统的上下文更新模块。用户为缺失参数补充了值，"
+            "请把这些参数值映射到 Redis 上下文中合适的字段，以便后续子任务（如数据分析）直接使用。\n\n",
+            f"【无人机】{info.get('agent_id', '')}\n",
+            f"【所属任务】{info.get('task_id', '')}\n",
+            f"【目标工具】{info.get('tool_name', '')}\n\n",
+            f"【用户提供的参数值】\n{json.dumps(values, ensure_ascii=False)}\n\n",
+            tool_params,
+            f"【当前 Redis 上下文】\n{json.dumps(current_context, ensure_ascii=False)}\n\n",
+            "【上下文字段规范（必须遵守）】\n"
+            "1. 模板中 uavs/targets/base 的位置字段只有 Longitude 和 Latitude，坐标为 x,y 格式需拆成两条。\n"
+            "2. 坐标值 \"x,y\" 拆成 uavs.N.Longitude 与 uavs.N.Latitude（或 targets 对应条目）。\n"
+            "3. 目标参数（如频率、带宽、信号强度）写入对应 target 条目（用 id 定位，如 targets.T1.Frequency）。\n"
+            "4. 无人机自身属性写 uavs 条目（如 uavs.UAV_1.Frequency）。\n"
+"5. 确实无处安放时，可新增通用字段但没有更好的位置则返回 {}\n\n"
+            "【值单位规则】\n"
+            "1. **保留用户提供的值和单位**，禁止剥离单位、禁止换算。如 \"2GHz\" 就写 \"2GHz\"。\n"
+            "2. 坐标字符串（x,y）拆成 Longitude 与 Latitude 两条（唯一需要拆分的情况）。\n\n"
+            "【结果归属判断】\n"
+            "1. 优先写入 task_id 对应的 target（如 task_id=T1 与 target.id=T1）。\n"
+            "2. 无法确定目标时，根据参数名语义放入 target 第一项。\n\n"
+            "请输出 JSON 对象表示要更新到 Redis 的字段映射。\n",
+            'key 为点号分隔路径（如 "targets.T1.Frequency"），value 为带单位的参数值。'
+            "value 若是不带单位的坐标字符串，拆成经度/纬度两条。"
+        ]
+        prompt = "".join(prompt_parts)
+
+        try:
+            from langchain_core.messages import HumanMessage
+            response = await llm.ainvoke([HumanMessage(content=prompt)])
+            content = str(response.content).strip()
+        except Exception as e:
+            sys.stderr.write(f"[Fleet] 用户参数映射调用失败: {e}\n")
+            sys.stderr.flush()
+            return
+
+        import re as _re
+        try:
+            m = _re.search(r"\{.*\}", content, _re.DOTALL)
+            updates = json.loads(m.group()) if m else None
+        except Exception:
+            updates = None
+        if not updates or not isinstance(updates, dict):
+            return
+
+        nested = {}
+        for key_path, val in updates.items():
+            parts = key_path.split(".")
+            d = nested
+            for p in parts[:-1]:
+                d = d.setdefault(p, {})
+            d[parts[-1]] = val
+
+        self.redis_mgr.update_context(session_id, nested)
+        sys.stderr.write(f"[Fleet] 指挥将用户参数写入上下文: {json.dumps(nested, ensure_ascii=False)}\n")
+        sys.stderr.flush()
 
     # ─────────────────────────────────────────────────────────────
     
