@@ -18,8 +18,7 @@ import requests
 from core.state import AgentState, Deps
 from core.config import OLLAMA_BASE, MODEL, BASE_DIR
 from core.fleet_config import (
-    SubTask, UAVConfig, FleetPhase, FleetPlan,
-    ExecutionMode, UAVRole, generate_fleet_id,
+    SubTask, UAVConfig, UAVRole, generate_fleet_id,
 )
 from core.redis_manager import get_redis_manager
 from fleet.fleet_manager import FleetManager
@@ -732,31 +731,4 @@ def _extract_json(text: str) -> dict | None:
     return None
 
 
-def _format_fleet_plan(data: dict) -> str:
-    """格式化舰队计划为可读文本"""
-    lines = []
-    
-    lines.append(f"场景: {data.get('scenario', '未知')}")
-    lines.append(f"UAV数量: {data.get('uav_count', 0)}")
-    lines.append("")
-    
-    # UAV 配置
-    lines.append("UAV 配置:")
-    for cfg in data.get("uav_configs", []):
-        lines.append(f"  - {cfg.get('uav_id', '')}: 角色={cfg.get('role', '')}, 能力={cfg.get('capabilities', [])}")
-    lines.append("")
-    
-    # 阶段和子任务
-    lines.append("任务阶段:")
-    for phase in data.get("fleet_phases", []):
-        lines.append(f"  [{phase.get('phase_id', '')}] {phase.get('phase_name', '')}")
-        lines.append(f"    目标: {phase.get('goal', '')}")
-        lines.append(f"    执行模式: {phase.get('execution_mode', 'parallel')}")
-        
-        for task in phase.get("sub_tasks", []):
-            lines.append(f"    - {task.get('task_id', '')}: {task.get('task_name', '')}")
-            lines.append(f"      目标: {task.get('goal', '')}")
-            if task.get("prerequisite_tasks"):
-                lines.append(f"      依赖: {task.get('prerequisite_tasks', [])}")
-    
-    return "\n".join(lines)
+

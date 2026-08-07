@@ -257,15 +257,6 @@ class Retriever:
             })
         return out
 
-    def get_embedding(self, text: str) -> list[float]:
-        """获取单条文本的嵌入向量"""
-        resp = requests.post(
-            f"{self.ollama_base}/api/embed",
-            json={"model": "bge-m3:latest", "input": [text]},
-        )
-        resp.raise_for_status()
-        return resp.json()["embeddings"][0]
-
     @property
     def doc_count(self) -> int:
         return self.collection.count()

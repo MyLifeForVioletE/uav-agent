@@ -5,40 +5,45 @@
       "roles":["uav"],
       "description":"根据任务起飞点、目标点、地图文件、盲区文件、畅通区文件，生成可执行航线对应的文件",
       "executor":"tool",
-      "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\pathplanning\\pathPlanning.exe",
+      "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\pathplanning\\pathPlannning.exe",
       "input_schema":{
-        "startPosition":{
+        "startPositionLong":{
           "type":"object",
           "format":"comma",
-          "prefix":"--start",
-          "description":"起点坐标"
+          "description":"起点经度"
         },
-        "destination":{
+        "startPositionLat":{
           "type":"object",
           "format":"comma",
-          "prefix":"--goal",
-          "description":"终点坐标"
+          "description":"起点纬度"
+        },
+        "destinationLong":{
+          "type":"object",
+          "format":"comma",
+          "description":"终点经度"
+        },
+        "destinationLat":{
+          "type":"object",
+          "format":"comma",
+          "description":"终点纬度"
         },
         "map":{
           "type":"file",
-          "prefix":"--map",
           "description":"存储地图信息的文件"
         },
         "bilndArea":{
           "type":"file",
-          "prefix":"--blind",
           "description":"盲区信息的文件"
         },
         "CoverageArea":{
           "type":"file",
-          "prefix":"--clear",
           "description":"畅通区信息的文件"
         }
       },
       "output_schema":{
         "path":{
-          "type":"file",
-          "description":"路径文件"
+          "type":"array",
+          "description":"航迹点列表，每个航迹点为 (经度,纬度,高度,时间) 四元组，如 (70,15.01,0,0)"
         }
       },
       "done_when":"工具返回成功",
@@ -73,10 +78,6 @@
         }
       },
       "output_schema":{
-        "flag":{
-          "type":"object",
-          "description":"通信成功与否标志，true表示成功，false表示失败"
-        },
         "time":{
           "type":"object",
           "description":"通信时长"

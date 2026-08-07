@@ -17,7 +17,6 @@ async def execute_external(action: dict, context: dict) -> dict:
         执行结果：{"success": bool, "output": str, "error": str}
     """
     action_name = action.get("action_name", "")
-    required_inputs = action.get("required_inputs", [])
 
     sys.stderr.write(f"[External] 执行外部动作: {action_name}\n")
     sys.stderr.flush()

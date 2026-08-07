@@ -12,7 +12,6 @@ from core.redis_manager import RedisManager
 from core.config import BASE_DIR, COORDINATOR_ID
 from core.kafka_bus import get_kafka_bus
 from agent.sub_agent import SubAgent
-from .state_sync import StateSync
 
 
 def _load_algorithm_list_text() -> str:
@@ -39,6 +38,20 @@ def _load_algorithm_list_text() -> str:
     return "\n".join(lines)
 
 
+def _is_stub_placeholder_output(output: str) -> bool:
+    """判断是否为非 exe 算法 stub 的占位输出（格式: 输出;字段名列表）。
+
+    stub 工具不调用 exe，stdout 仅为 "输出;tFreq, tBand" 之类的字段名列表，
+    不含真实数据。若把它交给指挥 LLM 提取，LLM 常把字段名当成值写入 Redis，
+    污染算法的空占位（如 sweepData 从 "" 变成 "sweepData"）。此类输出应跳过提取。
+    """
+    if not output:
+        return False
+    import re
+    # stub 输出为逗号/空格分隔的字段名标识符列表，不含数字、坐标等真实数据
+    return bool(re.fullmatch(r"输出;[\s,，、]*(?:[A-Za-z_][A-Za-z0-9_]*[\s,，、]*)*", str(output).strip()))
+
+
 class FleetManager:
     """Fleet 管理器：协调多个子agent的生命周期"""
     
@@ -50,8 +63,6 @@ class FleetManager:
         self.redis_mgr = redis_mgr
         self.sub_agents: Dict[str, SubAgent] = {}   # uav_id → SubAgent
         self.task_to_agent: Dict[str, str] = {}       # task_id → agent_id
-        self.state_sync = StateSync()
-        self._execution_strategy = "hybrid"           # parallel | sequential | hybrid
         self._running_tasks: set = set()              # 正在执行的 task_id 集合
         self._completed_tasks: set = set()            # 已完成的 task_id 集合（执行完成）
         self._planned_tasks: set = set()              # 已规划但未执行的任务
@@ -193,34 +204,23 @@ class FleetManager:
                 sys.stderr.write(f"[Fleet] 规划记录落 Redis 失败: {e}\n")
                 sys.stderr.flush()
 
-    def _script_path(self, session_id: str, seg: int) -> str:
+    def _script_path(self, session_id: str) -> str:
+        """统一任务脚本路径：整个任务写入同一个文件"""
         out_dir = BASE_DIR / "output"
         out_dir.mkdir(parents=True, exist_ok=True)
-        return out_dir / f"actions_script_{session_id}_part{seg}.txt"
-
-    def _next_script_seg(self, session_id: str) -> int:
-        """根据已存在的 part 文件个数推导下一个段号（不依赖内存 state，跨 tick/重启安全）"""
-        out_dir = BASE_DIR / "output"
-        try:
-            if out_dir.is_dir():
-                existing = [p for p in out_dir.glob(f"actions_script_{session_id}_part*.txt")]
-                return len(existing) + 1
-        except Exception:
-            pass
-        return 1
+        return out_dir / f"actions_script_{session_id}.txt"
 
     def _finalize_script_segment(self, state: AgentState, reason: str = ""):
-        """结束当前脚本段：在最新段文件写入结束标记（下次写入自然开新段文件）"""
+        """在统一脚本中写入暂停标记（整个任务仍写入同一个文件）"""
         session_id = state.get("session_id", "default")
-        seg = self._next_script_seg(session_id)
         try:
-            script_path = self._script_path(session_id, seg)
+            script_path = self._script_path(session_id)
             with open(script_path, "a", encoding="utf-8") as f:
-                f.write(f"# === 段结束 === {reason}\n" if reason else "# === 段结束 ===\n")
-            sys.stderr.write(f"[Fleet] 脚本段 {seg} 结束({reason}): {script_path}\n")
+                f.write(f"# === 暂停 === {reason}\n" if reason else "# === 暂停 ===\n")
+            sys.stderr.write(f"[Fleet] 脚本暂停标记: {script_path} :: {reason}\n")
             sys.stderr.flush()
         except Exception as e:
-            sys.stderr.write(f"[Fleet] 脚本段结束标记写入失败: {e}\n")
+            sys.stderr.write(f"[Fleet] 脚本暂停标记写入失败: {e}\n")
             sys.stderr.flush()
 
     def _write_action_script_line(self, state: AgentState, msg: dict):
@@ -236,16 +236,24 @@ class FleetManager:
         tool_name = action.get("tool_name", action.get("action_name", ""))
         tool_inputs = action.get("tool_inputs", {}) or {}
         params = ", ".join(f"{k}={v}" for k, v in tool_inputs.items() if str(v).strip())
+        output = payload.get("output", "") or ""
 
-        line = f"[{from_id} 步骤 {step_idx+1}/{total}] {action_name}"
+        agent_label = "分析Agent" if from_id == self._INFO_PROCESSOR_ID else "无人机Agent"
+        # total=0 表示分析 agent（总步骤不定，只显示连续步骤号）；否则显示 N/total
+        step_info = f"步骤 {step_idx+1}" if total <= 0 else f"步骤 {step_idx+1}/{total}"
+        line = f"[{from_id} {agent_label} {step_info}] {action_name or (tool_name if tool_name else '未知动作')}"
         if tool_name and params:
             line += f" | {tool_name}({params})"
         elif tool_name:
             line += f" | {tool_name}"
+        if output:
+            out_summary = output.strip().replace("\n", " ")
+            if len(out_summary) > 300:
+                out_summary = out_summary[:300] + "...(截断)"
+            line += f"  => {out_summary}"
 
         try:
-            seg = self._next_script_seg(session_id)
-            script_path = self._script_path(session_id, seg)
+            script_path = self._script_path(session_id)
             with open(script_path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
             sys.stderr.write(f"[Fleet] 已写入脚本文件: {script_path} :: {line}\n")
@@ -414,6 +422,13 @@ class FleetManager:
             "source": from_id,
         }
 
+        # 非 exe 算法 stub 占位输出（"输出;字段名列表"）不含真实数据，
+        # 跳过指挥 LLM 提取，避免把字段名写成值污染空占位。
+        if _is_stub_placeholder_output(output):
+            sys.stderr.write(f"[Fleet] {tool_name or from_id} stub 占位输出，跳过上下文提取: {str(output)[:80]}\n")
+            sys.stderr.flush()
+            return
+
         # 指挥 LLM 提取 → 写 Redis
         if self.redis_mgr:
             try:
@@ -517,6 +532,12 @@ class FleetManager:
         nested = {}
         for key_path, val in updates.items():
             parts = key_path.split(".")
+            # 过滤 path：航线已由 tool_executor（_write_path_to_redis）结构化写入 uavs[].path，
+            # 不允许 LLM 重复写入（会污染 targets.T1.path，或用扁平数组覆盖结构）。
+            if "path" in {p.strip() for p in parts}:
+                sys.stderr.write(f"[Fleet] 忽略 LLM 写入的 path 字段: {key_path}（由 tool_executor 负责）\n")
+                sys.stderr.flush()
+                continue
             d = nested
             for p in parts[:-1]:
                 d = d.setdefault(p, {})
@@ -594,13 +615,6 @@ class FleetManager:
         except Exception:
             pass
         return {"reply": raw, "instructions": []}
-
-    async def send_instruction(self, to_agent_id: str, content: str, state: AgentState = None):
-        """指挥主动向子 agent 下发指令（任务调整/约束更新）"""
-        if self._bus:
-            session_id = (state or {}).get("session_id", "default")
-            await self._bus.send(self._COORD_ID, to_agent_id, "instruction", content,
-                                 payload={"session_id": session_id})
 
     async def _send_reply(self, state: AgentState, to_agent_id: str, content: str,
                           correlation_id: str = None, payload: dict = None):
@@ -943,7 +957,7 @@ class FleetManager:
                     return
             
             await agent.run_step()
-            
+
             # 保存子agent状态到 Redis
             if self.redis_mgr:
                 self.redis_mgr.save_agent_state(agent_id, agent.state)
@@ -998,43 +1012,7 @@ class FleetManager:
         for uav_id, agent in self.sub_agents.items():
             uav_states[uav_id] = agent.get_status_dict()
         state["uav_states"] = uav_states
-    
-    def detect_conflicts(self, state: AgentState) -> list[dict]:
-        """
-        检测资源冲突：
-        - 两个子agent同时使用同一算法工具（如同一 XML 参数文件）
-        - 两个子agent的航线交叉
-        - 时间窗口重叠
-        """
-        conflicts = []
-        
-        # 简单检测：多个子agent在同一个UAV上
-        uav_task_count = {}
-        for task in state.get("sub_tasks", []):
-            uav_id = task.get("assigned_uav")
-            if uav_id:
-                uav_task_count[uav_id] = uav_task_count.get(uav_id, 0) + 1
-        
-        # 如果一个UAV分配了太多任务，可能需要调整
-        for uav_id, count in uav_task_count.items():
-            if count > 3:  # 阈值
-                conflicts.append({
-                    "type": "overload",
-                    "uav_id": uav_id,
-                    "description": f"UAV {uav_id} 分配了 {count} 个任务，可能超载",
-                })
-        
-        return conflicts
-    
-    def resolve_conflict(self, state: AgentState, conflict: dict) -> bool:
-        """解决冲突"""
-        if conflict.get("type") == "overload":
-            # 简单策略：将部分任务重新分配
-            sys.stderr.write(f"[Fleet] 解决冲突: {conflict.get('description', '')}\n")
-            sys.stderr.flush()
-            return True
-        return False
-    
+
     def get_aggregated_results(self, state: AgentState) -> dict:
         """聚合所有子agent的执行结果"""
         results = {
@@ -1062,15 +1040,3 @@ class FleetManager:
             }
 
         return results
-    
-    def reset(self):
-        """重置Fleet管理器"""
-        self.sub_agents.clear()
-        self._info_processor_agent = None
-        self.task_to_agent.clear()
-        self._running_tasks.clear()
-        self._completed_tasks.clear()
-        self._planned_tasks.clear()
-        self._saved_plans.clear()
-        self._phase = "planning"
-        self.state_sync = StateSync()

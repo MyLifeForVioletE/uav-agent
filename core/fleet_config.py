@@ -1,13 +1,6 @@
 """多机协同配置数据结构"""
 from dataclasses import dataclass, field
-from typing import Any
 from enum import Enum
-
-
-class CollaborationMode(str, Enum):
-    """协同模式"""
-    SINGLE = "single"  # 单机模式
-    MULTI = "multi"    # 多机模式
 
 
 class UAVRole(str, Enum):
@@ -18,22 +11,6 @@ class UAVRole(str, Enum):
     JAMMER = "jammer"        # 干扰机
     INTERFERER = "interferer" # 干扰机（别名）
     RELAY = "relay"          # 中继机
-
-
-class ExecutionMode(str, Enum):
-    """执行模式"""
-    PARALLEL = "parallel"    # 并行执行
-    SEQUENTIAL = "sequential"  # 顺序执行
-    HYBRID = "hybrid"        # 混合执行（依赖图决定）
-
-
-class SubAgentStatus(str, Enum):
-    """子Agent状态"""
-    IDLE = "idle"
-    PLANNING = "planning"
-    EXECUTING = "executing"
-    DONE = "done"
-    ERROR = "error"
 
 
 @dataclass
@@ -105,63 +82,6 @@ class SubTask:
             "constraints": self.constraints,
             "earliest_start": self.earliest_start,
             "deadline": self.deadline,
-        }
-
-
-@dataclass
-class FleetPhase:
-    """舰队阶段"""
-    phase_id: str                         # 阶段ID
-    phase_name: str                       # 阶段名称
-    goal: str                             # 阶段目标
-    execution_mode: ExecutionMode = ExecutionMode.PARALLEL
-    sub_tasks: list[SubTask] = field(default_factory=list)
-    
-    def to_dict(self) -> dict:
-        return {
-            "phase_id": self.phase_id,
-            "phase_name": self.phase_name,
-            "goal": self.goal,
-            "execution_mode": self.execution_mode.value,
-            "sub_tasks": [t.to_dict() for t in self.sub_tasks],
-        }
-
-
-@dataclass
-class FleetPlan:
-    """舰队级规划"""
-    scenario: str                         # 多机协同任务场景描述
-    uav_count: int                        # 参与协同的无人机数量
-    uav_configs: list[UAVConfig] = field(default_factory=list)
-    fleet_phases: list[FleetPhase] = field(default_factory=list)
-    coordination_rules: list[dict] = field(default_factory=list)  # 协调规则
-    
-    def to_dict(self) -> dict:
-        return {
-            "scenario": self.scenario,
-            "uav_count": self.uav_count,
-            "uav_configs": [c.to_dict() for c in self.uav_configs],
-            "fleet_phases": [p.to_dict() for p in self.fleet_phases],
-            "coordination_rules": self.coordination_rules,
-        }
-
-
-@dataclass
-class InterUAVDependency:
-    """跨机依赖关系"""
-    from_uav: str                        # 依赖来源UAV
-    to_uav: str                          # 依赖目标UAV
-    depends_on_task: str                 # 依赖的任务ID
-    data_key: str                        # 数据键
-    data_type: str = "any"               # 数据类型
-    
-    def to_dict(self) -> dict:
-        return {
-            "from_uav": self.from_uav,
-            "to_uav": self.to_uav,
-            "depends_on_task": self.depends_on_task,
-            "data_key": self.data_key,
-            "data_type": self.data_type,
         }
 
 

@@ -197,25 +197,6 @@ def _scan_knowledge_dir() -> list[dict]:
     return files
 
 
-def _validate_param_value(value: str, param_type: str) -> bool:
-    """校验参数值是否匹配预期类型"""
-    import re
-    v = value.strip()
-    if not v:
-        return False
-    if param_type == "file":
-        return v.endswith((".json", ".txt", ".ldf", ".csv", ".xml", ".yaml", ".yml")) or "\\" in v or "/" in v
-    if param_type == "tuple":
-        return bool(re.match(r'^\s*\(\s*[\d.]+\s*,\s*[\d.]+\s*\)\s*$', v))
-    if param_type == "number":
-        try:
-            float(v)
-            return True
-        except ValueError:
-            return False
-    return True
-
-
 def _normalize_param_value(value: str, param_type: str, param_format: str = "") -> str:
     """
     将 LLM 提取的参数值规范化为算法需要的格式。
@@ -404,11 +385,49 @@ async def _llm_extract_value_from_file(llm, file_path: str, file_ext: str,
         return None
 
 
+def _resolve_context_path(context: dict, path: str) -> Optional[str]:
+    """按点号路径从上下文对象中取真实值；数组支持数字索引或 id 定位。
+
+    值一律来自上下文原文（LLM 只负责给路径，禁止编造数值）；
+    值缺失或为空字符串返回 None。
+    """
+    if not context or not path:
+        return None
+    parts = [p.strip() for p in path.strip().strip('"').strip("'").split(".") if p.strip()]
+    current = context
+    for p in parts:
+        if isinstance(current, list):
+            idx = None
+            if p.isdigit():
+                idx = int(p)
+            else:
+                for i, item in enumerate(current):
+                    if isinstance(item, dict) and str(item.get("id")) == p:
+                        idx = i
+                        break
+            if idx is None or not (0 <= idx < len(current)):
+                return None
+            current = current[idx]
+        elif isinstance(current, dict) and p in current:
+            current = current[p]
+        else:
+            return None
+    if current is None:
+        return None
+    if isinstance(current, str):
+        return current.strip() or None
+    if isinstance(current, (dict, list)):
+        s = json.dumps(current, ensure_ascii=False)
+        return s if s not in ("{}", "[]") else None
+    return str(current)
+
+
 async def _llm_extract_from_context(llm, param_name: str, param_desc: str,
                                      param_type: str, context: dict, goal: str = "") -> Optional[str]:
     """
-    用 LLM 从结构化上下文中提取指定参数的值
-    Returns: 提取到的值，或 None
+    用 LLM 从结构化上下文中定位与参数语义最匹配的字段路径，
+    值一律从上下文原文读取（禁止 LLM 自行生成/编造数值）。
+    Returns: 上下文中的真实值，或 None
     """
     if not llm or not context:
         sys.stderr.write(f"[ToolExecutor] _llm_extract_from_context: llm={llm is not None}, context={'有' if context else '空'}\n")
@@ -417,46 +436,192 @@ async def _llm_extract_from_context(llm, param_name: str, param_desc: str,
     
     context_text = json.dumps(context, ensure_ascii=False, indent=2)
     
-    sys.stderr.write(f"[ToolExecutor] LLM提取: {param_name}({param_desc}), goal={goal[:50] if goal else ''}, 上下文有 {len(context)} 个分组\n")
+    sys.stderr.write(f"[ToolExecutor] LLM定位键: {param_name}({param_desc}), goal={goal[:50] if goal else ''}, 上下文有 {len(context)} 个分组\n")
     sys.stderr.flush()
     
     goal_hint = f"\n动作目标：{goal}\n根据动作目标理解该参数的含义。" if goal else ""
     
-    prompt = f"""从结构化上下文中提取指定参数的值。
+    prompt = f"""在结构化上下文中找到与指定参数语义最匹配的字段。
 {goal_hint}
 结构化上下文：
 {context_text}
 
-需要提取的参数：
+需要匹配的参数：
 - 参数名: {param_name}
 - 参数描述: {param_desc}
 - 参数类型: {param_type}
 
-请从上下文中找到与该参数语义最匹配的值，只返回值本身（不要参数名、不要引号、不要其他内容）。
-如果上下文中的值是带单位的频率（如 GHz/MHz/kHz），必须**保留单位**返回（如 "2GHz"），禁止去掉单位。
-例如 goal 说"从起始点到目标位置1"，那么 uavPosition 应该返回起始点坐标，targetPosition 应该返回目标位置1坐标。
-如果没有找到匹配的值，返回 "NONE"。"""
+【要求】
+1. 只输出该字段的完整 JSON 点号路径，禁止输出字段的值或任何编造的数据。
+2. 路径格式：数组元素用数字索引或 id 定位（如 targets.0.Frequency 或 targets.T1.Frequency），
+   其他逐级用点号拼接（如 base.Longitude、uavs.UAV_1.Latitude）。
+3. 若上下文中不存在与参数语义匹配的字段，输出 "NONE"。
+
+只输出一行路径或 "NONE"，不要输出其他任何内容。"""
 
     try:
         from langchain_core.messages import HumanMessage
         response = await _ainvoke_with_timeout(llm, prompt)
-        result = response.strip()
+        path = response.strip().strip('"').strip("'")
         
-        sys.stderr.write(f"[ToolExecutor] LLM提取结果: '{result}'\n")
+        sys.stderr.write(f"[ToolExecutor] LLM键路径: '{path}'\n")
         sys.stderr.flush()
         
-        if result == "NONE" or not result:
+        if not path or path.upper() == "NONE":
             return None
         
-        return result
+        value = _resolve_context_path(context, path)
+        if value is None:
+            sys.stderr.write(f"[ToolExecutor] 路径未命中或值为空: '{path}'\n")
+            sys.stderr.flush()
+            return None
+        
+        sys.stderr.write(f"[ToolExecutor] 命中 {path} = {str(value)[:80]}\n")
+        sys.stderr.flush()
+        return value
     except asyncio.TimeoutError:
-        sys.stderr.write(f"[ToolExecutor] LLM上下文提取超时({LLM_CALL_TIMEOUT}s): {param_name}，尝试本地降级\n")
+        sys.stderr.write(f"[ToolExecutor] LLM定位键超时({LLM_CALL_TIMEOUT}s): {param_name}\n")
         sys.stderr.flush()
         return None
     except Exception as e:
-        sys.stderr.write(f"[ToolExecutor] LLM提取失败: {e}\n")
+        sys.stderr.write(f"[ToolExecutor] LLM定位键失败: {e}\n")
         sys.stderr.flush()
         return None
+
+
+def _param_placeholder_names(context: dict, tool_inputs: dict) -> set:
+    """识别应保持为空占位的参数字段。
+
+    规则：某一参数名若在原上下文中已存在，且其值为空占位
+    （由不执行 exe 的算法建立，如扫频侦察的 sweepData），则后续无论 LLM
+    如何猜测，都不允许用无关上下文数据（如航迹点）覆盖，保持"只留参数名"。
+
+    Returns: 应清空为占位参数名的参数名集合。
+    """
+    if not context:
+        return set()
+    pnames = {k for k in tool_inputs if str(k).strip()}
+    matched = set()
+    for group in context.values():
+        if not isinstance(group, list):
+            group = [group]
+        for item in group:
+            if not isinstance(item, dict):
+                continue
+            for k in pnames:
+                if k in item and not str(item[k] or "").strip():
+                    matched.add(k)
+    return matched
+
+
+def _write_output_placeholders(redis_mgr, session_id: str, tool_name: str, output_schema: dict):
+    """按算法的输出 schema 在 Redis 上下文中建立输出占位字段。
+
+    即使算法未真实执行（值暂为空），也保证后续任务可按输出名读取到该字段。
+    """
+    if not output_schema or not redis_mgr:
+        return
+    session_id = session_id or "default"
+    try:
+        context = redis_mgr.get_context(session_id) or {}
+        targets = context.get("targets")
+        if isinstance(targets, list) and targets:
+            # 输出归属到第一个目标条目（多数算法输出是对目标的分析结果）
+            update = {"targets": {0: {}}}
+            for fname in output_schema:
+                # 已存在的输出名保留原值，否则置为空字符串作为占位
+                update["targets"][0][fname] = targets[0].get(fname, "")
+        else:
+            update = {}
+            for fname in output_schema:
+                update[fname] = context.get(fname, "")
+        redis_mgr.update_context(session_id, update)
+        sys.stderr.write(f"[ToolExecutor] 已建立输出占位: {tool_name} => {json.dumps(update, ensure_ascii=False)}\n")
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"[ToolExecutor] 输出占位写入失败: {e}\n")
+        sys.stderr.flush()
+
+
+def _parse_waypoints(stdout: str) -> list:
+    """从路径规划 stdout 解析航迹点列表。
+
+    输出形如 (lng,lat,alt,time),(lng,lat,alt,time),... ，每个四元组：
+    经度, 纬度, 高度, 时间。
+    """
+    if not stdout:
+        return []
+    import re as _re
+    waypoints = []
+    for m in _re.finditer(r"\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\)", stdout):
+        try:
+            waypoints.append({
+                "Longitude": float(m.group(1)),
+                "Latitude": float(m.group(2)),
+                "Altitude": float(m.group(3)),
+                "Time": float(m.group(4)),
+            })
+        except (ValueError, TypeError):
+            continue
+    return waypoints
+
+
+def _write_path_to_redis(redis_mgr, session_id: str, state: dict, tool_inputs: dict, output: str):
+    """路径规划成功后，将航迹点写入 Redis 上下文（关联到对应的无人机）。
+
+    记录该航迹由哪架无人机、从哪个起点到哪个终点。
+    """
+    if not redis_mgr:
+        return
+    session_id = session_id or "default"
+    waypoints = _parse_waypoints(str(output or ""))
+    if not waypoints:
+        sys.stderr.write("[ToolExecutor] 未从路径规划输出中解析到航迹点\n")
+        sys.stderr.flush()
+        return
+    try:
+        agent_id = (state or {}).get("_agent_id") or "UAV_1"
+        # 起点/终点：优先取经规范化的 tool_inputs 坐标，其次尝试逗号拆分的组合字段
+        start_lon = str((tool_inputs.get("startPositionLong") or "")).strip()
+        start_lat = str((tool_inputs.get("startPositionLat") or "")).strip()
+        end_lon = str((tool_inputs.get("destinationLong") or "")).strip()
+        end_lat = str((tool_inputs.get("destinationLat") or "")).strip()
+        # 去除可能残留的括号
+        start_lon = start_lon.strip("()").strip()
+        start_lat = start_lat.strip("()").strip()
+        end_lon = end_lon.strip("()").strip()
+        end_lat = end_lat.strip("()").strip()
+
+        route = {
+            "agent": agent_id,
+            "from_lon": start_lon,
+            "from_lat": start_lat,
+            "to_lon": end_lon,
+            "to_lat": end_lat,
+            "waypoints": waypoints,
+        }
+        # 直接构建完整最新上下文并整体保存，避免 update_context 按 id 深合并时丢弃新增 uav
+        ctx = redis_mgr.get_context(session_id) or {}
+        uavs = ctx.get("uavs")
+        if not isinstance(uavs, list):
+            uavs = []
+            ctx["uavs"] = uavs
+        for u in uavs:
+            if isinstance(u, dict) and u.get("id") == agent_id:
+                u.update({"Longitude": start_lon, "Latitude": start_lat, "path": route})
+                break
+        else:
+            uavs.append({"id": agent_id, "Longitude": start_lon, "Latitude": start_lat,
+                         "path": route})
+        redis_mgr.save_context(session_id, ctx)
+        sys.stderr.write(
+            f"[ToolExecutor] 已写入航迹: {agent_id} "
+            f"[{start_lon},{start_lat}] -> [{end_lon},{end_lat}] 共{len(waypoints)}个航迹点\n"
+        )
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"[ToolExecutor] 航迹写入 Redis 失败: {e}\n")
+        sys.stderr.flush()
 
 
 async def execute_tool_action(action: dict, context: dict) -> dict:
@@ -474,9 +639,12 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
     messages = context.get("messages", [])
     llm = context.get("llm", None)
     state = context.get("state", {})
-    
+
     tool_name = action.get("tool_name", action.get("action_name", ""))
-    tool_inputs = action.get("tool_inputs", {})
+    tool_inputs = dict(action.get("tool_inputs", {}))
+
+    # 是否需真实调用 exe：只有路径规划算法调用，其余算法模拟执行
+    real_exec = tool_name == "path_planning"
 
     # 查找匹配的工具
     tool = tools.get(tool_name)
@@ -500,6 +668,7 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
     algorithms = _get_algorithms()
     algo_config = algorithms.get(tool_name, {})
     input_schema = algo_config.get("input_schema", {})
+    output_schema = algo_config.get("output_schema", {})
     
     # 获取场景描述
     scene_description = state.get("original_scenario", "")
@@ -527,12 +696,32 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
     # 从 input_schema 获取所有需要的参数名，遍历检查
     required_params = list(input_schema.keys()) if input_schema else list(tool_inputs.keys())
     goal = action.get("goal", "")
+
+    # 空占位保护：上下文中已存在且值为空的参数字段（如未执行 exe 的扫频侦察建立的
+    # sweepData 占位），不允许被 LLM 用无关上下文数据（航迹点等）填充，保持"只留参数名"。
+    if not real_exec:
+        ctx_for_placeholder = redis_mgr.get_context(session_id)
+        placeholder_params = _param_placeholder_names(ctx_for_placeholder, tool_inputs)
+        if placeholder_params:
+            for p in placeholder_params:
+                tool_inputs[p] = p  # 只留参数名
+            sys.stderr.write(f"[ToolExecutor] 空占位保护: {tool_name} 参数 {sorted(placeholder_params)} 保持为参数名占位\n")
+            sys.stderr.flush()
+
     for param_name in required_params:
         param_value = tool_inputs.get(param_name, "")
-        # 如果参数已有有效值，跳过
-        if param_value and str(param_value).strip():
+        # 空占位保护已把该参数置为参数名（值为参数名），跳过查找
+        if str(param_value).strip() == param_name:
             continue
-        
+        # 非 exe 算法：LLM 猜测的值不可信（可能是参数描述/编造文本），
+        # 统一清空后走 Redis 查找，保证值一定来自上下文原文。
+        if param_value and str(param_value).strip():
+            if real_exec:
+                continue  # 真实 exe：已有值直接用
+            sys.stderr.write(f"[ToolExecutor] 非exe 清除 LLM 猜测值: {param_name}={param_value}\n")
+            sys.stderr.flush()
+            tool_inputs[param_name] = ""
+
         sys.stderr.write(f"[ToolExecutor] 参数 {param_name} 为空，开始查找...\n")
         sys.stderr.flush()
         
@@ -569,8 +758,14 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
                     sys.stderr.flush()
                     tool_inputs[param_name] = extracted_value
                     continue
+                elif not real_exec:
+                    # 不执行 exe 的算法：LLM 未查到值属于正常现象，不需本地降级，
+                    # 直接留空，交给末尾"非 exe 缺参用参数名占位"处理（写脚本时显示参数名）。
+                    sys.stderr.write(f"[ToolExecutor] LLM提取失败(非exe)，{param_name} 保持为空，交由参数名占位\n")
+                    sys.stderr.flush()
                 else:
-                    # LLM 超时/失败/返回 NONE → 本地降级（键值直取 + 语义启发式），仍缺才进入 missing_params
+                    # 真实 exe 算法（如 path_planning）：LLM 超时/失败/返回 NONE
+                    # → 本地降级（键值直取 + 语义启发式），仍缺才进入 missing_params
                     local_value = _local_resolve_param(context, param_name, param_desc, param_type)
                     if local_value:
                         sys.stderr.write(f"[ToolExecutor] LLM提取失败，本地降级补齐: {param_name}={local_value}\n")
@@ -593,9 +788,16 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
             if v and str(v).strip():
                 tool_inputs[p] = _normalize_param_value(v, pinfo.get("type", "string"), pinfo.get("format", ""))
 
-    # 检查必需参数是否齐全：input_schema 中仍为空的参数，不允许带空值调用算法
+    # 检查必需参数是否齐全
     if input_schema:
         missing = [p for p in input_schema if not str(tool_inputs.get(p, "")).strip()]
+        if missing and not real_exec:
+            # 非真实执行的算法：缺参时用参数名填充，保证能记录到脚本与 Redis 输出占位
+            sys.stderr.write(f"[ToolExecutor] {tool_name} 非 exe 执行，缺参用参数名填充: {missing}\n")
+            sys.stderr.flush()
+            for p in missing:
+                tool_inputs[p] = p
+            missing = []
         if missing:
             names = "、".join(f"{p}({input_schema[p].get('description', p)})" for p in missing)
             sys.stderr.write(f"[ToolExecutor] 缺少必需参数: {names}\n")
@@ -613,10 +815,13 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
                 "output": "",
                 "error": f"缺少必需参数: {names}",
                 "missing_params": missing_params,
+                "tool_inputs": tool_inputs,
                 "pending": False,
             }
 
     # 所有参数就绪，执行工具
+    # 无论是否真实调用 exe，都根据该算法的输出 schema 在 Redis 中建立输出占位字段（值暂为空）
+    _write_output_placeholders(redis_mgr, session_id, tool_name, output_schema)
     try:
         sys.stderr.write(f"[ToolExecutor] 执行工具 {tool_name}，参数: {tool_inputs}\n")
         sys.stderr.flush()
@@ -626,6 +831,45 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
         sys.stderr.write(f"[ToolExecutor] tool.ainvoke 返回: {result_text[:500]}\n")
         sys.stderr.flush()
 
+        # MCP 工具返回 content 列表，内嵌 JSON：{"returncode": ..., "stdout": ..., "stderr": ...}
+        # 解析出可读的 stdout 作为脚本输出（兼容 dict / Pydantic 对象）
+        returncode = None
+        readable = ""
+        inner_text = ""
+        try:
+            for item in result if isinstance(result, (list, tuple)) else [result]:
+                if isinstance(item, dict):
+                    item_text = item.get("text", "")
+                elif hasattr(item, "text"):
+                    item_text = getattr(item, "text", "")
+                else:
+                    item_text = ""
+                if item_text:
+                    inner_text = str(item_text)
+                    break
+        except Exception:
+            pass
+
+        import re as _re
+        try:
+            if inner_text:
+                parsed = json.loads(inner_text)
+                if isinstance(parsed, dict):
+                    if parsed.get("returncode") is not None:
+                        returncode = parsed.get("returncode")
+                    out = parsed.get("stdout", "")
+                    if out:
+                        readable = out if isinstance(out, str) else str(out)
+            if not readable:
+                # 兜底：从原始文本中正则提取 "stdout": "xxx"
+                m = _re.search(r'"stdout"\s*:\s*"((?:[^"\\]|\\.)*)"', inner_text or result_text)
+                if m:
+                    readable = m.group(1).encode().decode("unicode_escape", errors="ignore")
+        except Exception:
+            pass
+        if not readable:
+            readable = result_text
+
         # 将算法返回结果追加到消息历史，让 LLM 后续能看到算法输出
         try:
             from langchain_core.messages import ToolMessage
@@ -633,29 +877,23 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
         except Exception:
             pass
 
-        # MCP 工具返回 content 列表，内嵌 JSON：{"returncode": ..., "stdout": ..., "stderr": ...}
-        returncode = None
-        try:
-            for item in result if isinstance(result, list) else []:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    inner = json.loads(item.get("text", ""))
-                    returncode = inner.get("returncode")
-                    if returncode is not None:
-                        break
-        except Exception:
-            pass
-
         if returncode is not None and returncode != 0:
             return {
                 "success": False,
-                "output": result_text,
-                "error": f"算法 {tool_name} 执行失败（returncode={returncode}）: {result_text[:500]}",
+                "output": readable,
+                "error": f"算法 {tool_name} 执行失败（returncode={returncode}）: {readable[:500]}",
+                "tool_inputs": tool_inputs,
                 "pending": False,
             }
 
+        # 路径规划成功：把航迹点写入 Redis（关联无人机 + 起终点），并同步到脚本输出
+        if real_exec and tool_name == "path_planning":
+            _write_path_to_redis(redis_mgr, session_id, state, tool_inputs, readable)
+
         return {
             "success": True,
-            "output": result_text,
+            "output": readable,
+            "tool_inputs": tool_inputs,
             "error": "",
             "pending": False,
         }

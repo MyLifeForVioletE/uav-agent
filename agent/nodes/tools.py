@@ -2,10 +2,50 @@
 import sys
 import json
 
+from core.config import BASE_DIR
 from core.state import AgentState, Deps
 from core.redis_manager import get_redis_manager
 from tools.executor import execute_tool_calls
 from agent.executors import dispatch_executor
+
+
+def _append_analyst_script_line(state: AgentState, action: dict, result: dict, step_idx: int):
+    """分析 agent 直接把已执行动作写入统一任务脚本（与指挥侧的写行格式保持一致）。
+
+    走 Kafka 上报给指挥再回写存在消费竞态（调度循环提前结束即丢失），
+    分析 agent 单步同步执行，故直接落盘最可靠。
+    """
+    session_id = state.get("session_id") or "default"
+    agent_id = state.get("_agent_id") or "_info_processor_"
+    out_dir = BASE_DIR / "output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    script_path = out_dir / f"actions_script_{session_id}.txt"
+
+    action_name = action.get("action_name", "")
+    tool_name = action.get("tool_name", action.get("action_name", ""))
+    tool_inputs = action.get("tool_inputs", {}) or {}
+    params = ", ".join(f"{k}={v}" for k, v in tool_inputs.items() if str(v).strip())
+    output = str(result.get("output", "") or "")[:500]
+
+    line = f"[{agent_id} 分析Agent 步骤 {step_idx+1}] {action_name or (tool_name or '未知动作')}"
+    if tool_name and params:
+        line += f" | {tool_name}({params})"
+    elif tool_name:
+        line += f" | {tool_name}"
+    if output:
+        out_summary = output.strip().replace("\n", " ")
+        if len(out_summary) > 300:
+            out_summary = out_summary[:300] + "...(截断)"
+        line += f"  => {out_summary}"
+
+    try:
+        with open(script_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        sys.stderr.write(f"[Execute] 分析步骤写入脚本: {script_path} :: {line}\n")
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"[Execute] 分析步骤脚本写入失败: {e}\n")
+        sys.stderr.flush()
 
 
 def _apply_post_action_update(state: AgentState, action: dict, result: dict):
@@ -113,6 +153,8 @@ async def execute_tools(state: AgentState, deps: Deps) -> AgentState:
     # 与 UAV 执行路径一致，而非直接用 LLM 猜测的参数执行
     if state.get("_analyst_mode"):
         from langchain_core.messages import ToolMessage
+        # 分析 agent 步骤序号：每次工具调用递增，脚本中连续展示该 agent 的分析流程
+        analyst_step = state.get("_analyst_step", 0) + 1
         for tc in tcs:
             action = {
                 "executor": "tool",
@@ -130,16 +172,22 @@ async def execute_tools(state: AgentState, deps: Deps) -> AgentState:
                 result = await dispatch_executor(action, context)
             except Exception as e:
                 result = {"success": False, "output": "", "error": f"分析工具执行异常: {e}"}
+            if result.get("tool_inputs"):
+                action["tool_inputs"] = result["tool_inputs"]
             result_text = result.get("output", "") or result.get("error", "")
             state["output"] = result_text
             state["messages"].append(ToolMessage(content=result_text, tool_call_id=tc["id"]))
+            # 分析 agent 步骤：直接写统一脚本（确定性，不依赖指挥回传）
+            _append_analyst_script_line(state, action, result, analyst_step - 1)
+            analyst_step += 1
             if result.get("error"):
                 state["pending_question"] = result_text
                 return state
+        state["_analyst_step"] = analyst_step - 1
         return state
 
     # 委托 tool_executor 执行具体的工具调用流程
-    should_break, lct, lfp, plan_gen, plan_steps = await execute_tool_calls(
+    should_break, lct, lfp, plan_gen, _plan_steps = await execute_tool_calls(
         response, deps.tools, state["messages"], deps.llm_no_tools,
         state.get("calc_type"), state.get("file_path"), state.get("plan_generated", False),
         skip_summary=True, quiet=False,

@@ -18,6 +18,7 @@ from core.config import OLLAMA_BASE, MODEL, BASE_DIR
 from core.state import Deps
 from core.redis_manager import get_redis_manager
 from agent.sub_agent import SubAgent
+from tools.stub_tools import merge_stub_tools
 
 
 async def main():
@@ -37,7 +38,7 @@ async def main():
 
     async with client.session("mcp-server") as session:
         algo_tools = await load_mcp_tools(session)
-        tool_map = {t.name: t for t in algo_tools}
+        tool_map = {t.name: t for t in merge_stub_tools(algo_tools)}
         llm_plain = ChatOllama(model=MODEL, temperature=0, base_url=OLLAMA_BASE)
         deps = Deps(tools=tool_map, llm_no_tools=llm_plain, macro_planner=None,
                     constraint_planner=None, detail_planner=None, decomposer_planner=None)

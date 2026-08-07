@@ -83,62 +83,6 @@ class RedisManager:
             sys.stderr.flush()
             return False
     
-    def get_session(self, session_id: str) -> Optional[dict]:
-        """获取用户会话状态"""
-        if not self._is_available():
-            return None
-        
-        try:
-            key = f"session:{session_id}"
-            data = self.client.get(key)
-            if data:
-                state = json.loads(data)
-                # 反序列化 state
-                return self._deserialize_state(state)
-            return None
-        except Exception as e:
-            sys.stderr.write(f"[Redis] 获取会话失败: {e}\n")
-            sys.stderr.flush()
-            return None
-    
-    def delete_session(self, session_id: str) -> bool:
-        """删除用户会话"""
-        if not self._is_available():
-            return False
-        
-        try:
-            # 删除会话状态
-            key = f"session:{session_id}"
-            self.client.delete(key)
-            
-            # 删除消息历史
-            msg_key = f"session:{session_id}:messages"
-            self.client.delete(msg_key)
-            
-            # 从索引中移除
-            self.client.srem("sessions:index", session_id)
-            
-            sys.stderr.write(f"[Redis] 删除会话: {session_id}\n")
-            sys.stderr.flush()
-            return True
-        except Exception as e:
-            sys.stderr.write(f"[Redis] 删除会话失败: {e}\n")
-            sys.stderr.flush()
-            return False
-    
-    def list_sessions(self) -> list[str]:
-        """列出所有活跃会话"""
-        if not self._is_available():
-            return []
-        
-        try:
-            sessions = self.client.smembers("sessions:index")
-            return list(sessions) if sessions else []
-        except Exception as e:
-            sys.stderr.write(f"[Redis] 列出会话失败: {e}\n")
-            sys.stderr.flush()
-            return []
-    
     # ═══════════════════════════════════════════
     #  消息历史
     # ═══════════════════════════════════════════
@@ -169,29 +113,8 @@ class RedisManager:
             sys.stderr.flush()
             return False
     
-    def get_messages(self, session_id: str, limit: int = 50) -> list[dict]:
-        """获取最近N条消息"""
-        if not self._is_available():
-            return []
-        
-        try:
-            key = f"session:{session_id}:messages"
-            messages = self.client.lrange(key, -limit, -1)
-            
-            result = []
-            for msg in messages:
-                if msg:
-                    deserialized = self._deserialize_message(json.loads(msg))
-                    result.append(deserialized)
-            
-            return result
-        except Exception as e:
-            sys.stderr.write(f"[Redis] 获取消息失败: {e}\n")
-            sys.stderr.flush()
-            return []
-    
     # ═══════════════════════════════════════════
-    #  子agent状态
+    #  通用工具方法
     # ═══════════════════════════════════════════
     
     def save_agent_state(self, agent_id: str, state: dict) -> bool:
@@ -217,22 +140,6 @@ class RedisManager:
             sys.stderr.write(f"[Redis] 保存agent状态失败: {e}\n")
             sys.stderr.flush()
             return False
-    
-    def get_agent_state(self, agent_id: str) -> Optional[dict]:
-        """获取子agent状态"""
-        if not self._is_available():
-            return None
-        
-        try:
-            key = f"agent:{agent_id}:state"
-            data = self.client.get(key)
-            if data:
-                return self._deserialize_state(json.loads(data))
-            return None
-        except Exception as e:
-            sys.stderr.write(f"[Redis] 获取agent状态失败: {e}\n")
-            sys.stderr.flush()
-            return None
     
     # ═══════════════════════════════════════════
     #  通用工具方法
@@ -266,27 +173,6 @@ class RedisManager:
             sys.stderr.write(f"[Redis] get失败: {e}\n")
             sys.stderr.flush()
             return None
-    
-    def exists(self, key: str) -> bool:
-        """检查键是否存在"""
-        if not self._is_available():
-            return False
-        
-        try:
-            return bool(self.client.exists(key))
-        except:
-            return False
-    
-    def delete(self, key: str) -> bool:
-        """删除键"""
-        if not self._is_available():
-            return False
-        
-        try:
-            self.client.delete(key)
-            return True
-        except:
-            return False
     
     # ═══════════════════════════════════════════
     #  参数缓存（结构化 JSON 对象）
@@ -381,16 +267,6 @@ class RedisManager:
             current = {}
         merged = self._deep_merge(current, new_data)
         return self.save_context(session_id, merged)
-    
-    # 旧接口保留，供 tool_executor 兼容调用
-    def save_param(self, session_id: str, tool_name: str, param_name: str, value: Any, metadata: dict = None) -> bool:
-        return True
-    
-    def get_param(self, session_id: str, tool_name: str, param_name: str) -> Optional[Any]:
-        return None
-    
-    def get_all_params(self, session_id: str) -> dict:
-        return self.get_context(session_id)
     
     # ═══════════════════════════════════════════
     #  序列化/反序列化

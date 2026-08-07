@@ -105,6 +105,7 @@ class SubAgent:
             "_last_response": None,
             "_intent": "",
             "_analyst_mode": is_analyst,
+            "_agent_id": self.agent_id,
             "session_id": self._session_id,
         }
 
@@ -361,6 +362,10 @@ class SubAgent:
             await self._request_param_resolution(action, result.get("missing_params", []))
             return
 
+        # 将执行器实际解析出的参数值写回动作，供上报脚本记录
+        if result.get("tool_inputs"):
+            action["tool_inputs"] = result["tool_inputs"]
+
         # 动作已执行：把动作及实际解析的参数值上报指挥（写脚本文件）
         await self._report_action_executed(action, result, idx, len(actions))
 
@@ -583,6 +588,14 @@ class SubAgent:
         post_action_update = action.get("post_action_update", "")
         if not post_action_update or not self.redis_mgr:
             return
+
+        # 非真实执行 exe 的工具（如扫频侦察、signalAnalysis）：输出仅为空占位，
+        # 已由 tool_executor._write_output_placeholders 写入，这里不允许 LLM 再编造结果值覆盖占位。
+        tool_name = action.get("tool_name", "")
+        if tool_name != "path_planning":
+            sys.stderr.write(f"[SubAgent {self.agent_id}] {tool_name} 非 exe 执行，跳过 post_action_update（输出为空占位）\n")
+            sys.stderr.flush()
+            return
         
         import json
         import requests
@@ -676,10 +689,6 @@ class SubAgent:
         sys.stderr.write(f"[SubAgent {self.agent_id}] post_action_update: {json.dumps(nested, ensure_ascii=False)}\n")
         sys.stderr.flush()
 
-    async def _update_context_from_result(self, action: dict, result: dict):
-        """（已废弃：算法结果改走指挥 agent 提取并写 Redis，见 fleet_manager._update_context_from_agent_result）"""
-        return
-
     def _sync_status(self):
         """从子agent状态同步 status/progress"""
         s = self.state
@@ -721,10 +730,6 @@ class SubAgent:
         if 0 <= idx < len(actions):
             return actions[idx].get("action_name", "")
         return ""
-    
-    def inject_context(self, context_msg: str):
-        """向子agent注入上下文消息（用于跨机数据共享）"""
-        self.state["messages"].append(SystemMessage(content=context_msg))
     
     def reset_for_next_task(self):
         """重置子agent状态，准备执行下一个任务"""

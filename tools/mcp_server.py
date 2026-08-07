@@ -29,10 +29,21 @@ def _convert_type(raw_type):
     return raw_type
 
 
+# 需要真正调用 exe 的算法（路径规划），仅此算法注册为 MCP 工具；
+# 其余算法不提供 MCP 注册，能力由本地 stub 工具（tools/stub_tools.py）对外暴露。
+REAL_EXE_ALGORITHMS = {"path_planning"}
+
+
 def build_tool_definitions(algorithms):
-    """将 algorithms.json 中的每个算法转为 MCP tools/list 响应格式的 tool schema"""
+    """将 algorithms.json 中的每个算法转为 MCP tools/list 响应格式的 tool schema
+
+    仅注册需要真实执行 exe 的算法（REAL_EXE_ALGORITHMS）；其余算法无需 MCP 调用，
+    交由上层本地 stub 工具处理，故不在此注册。
+    """
     tools = []
     for algo in algorithms:
+        if algo["name"] not in REAL_EXE_ALGORITHMS:
+            continue
         props = {}
         required = []
         input_schema = algo.get("input_schema", {})
@@ -66,9 +77,31 @@ def build_tool_definitions(algorithms):
 
 
 def execute_algorithm(algo, arguments):
-    """执行算法 exe：按参数定义顺序拼接命令行参数 → subprocess.run → 返回 stdout/stderr"""
+    """执行算法：仅 path_planning 真正调用 exe；其余算法跳过 exe，返回模拟结果。
+
+    非路径规划算法不实际执行外部程序，仅确认参数已确定，返回结构化模拟输出，
+    供上层据此建立 Redis 输出占位字段（即便当前没有真实值）。
+    """
     sys.stderr.write(f"[MCP] execute_algorithm: {algo['name']}, args={arguments}\n")
     sys.stderr.flush()
+    algo_name = algo.get("name", "")
+
+    # 非真实执行的算法：不调用 exe，返回模拟成功结果（含输出 schema，供占位）
+    if algo_name not in REAL_EXE_ALGORITHMS:
+        sys.stderr.write(f"[MCP] {algo_name} 跳过真实 exe 调用，返回模拟输出\n")
+        sys.stderr.flush()
+        out_schema = algo.get("output_schema", {})
+        output_files = ", ".join(out_schema.keys()) or "无"
+        mock = {
+            "note": f"算法 {algo_name} 未调用真实 exe，仅记录参数并建立输出占位",
+            "output_fields": list(out_schema.keys()),
+        }
+        return {
+            "returncode": 0,
+            "stdout": f"输出;{output_files}",
+            "stderr": "",
+        }
+
     exe_path = Path(algo["executable"])
     if not exe_path.is_file():
         return {"error": f"可执行文件不存在: {algo['executable']}"}

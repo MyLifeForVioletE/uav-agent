@@ -18,6 +18,7 @@ from core.prompts import SYSTEM_PROMPT
 from core.redis_manager import get_redis_manager
 from agent.coordinator import build_coordinator_graph
 from rag import TaskPlanner
+from tools.stub_tools import merge_stub_tools
 
 
 async def main():
@@ -46,7 +47,7 @@ async def main():
         decomposer_planner = TaskPlanner(docs_dir=rag_base, collection_name="decomposer_rag", glob_include=["task_decomposition/*.md"])
         macro_planner.index_docs(); constraint_planner.index_docs(); detail_planner.index_docs(); decomposer_planner.index_docs()
 
-        tool_map = {t.name: t for t in algo_tools}
+        tool_map = {t.name: t for t in merge_stub_tools(algo_tools)}
         llm_plain = ChatOllama(model=MODEL, temperature=0, base_url=OLLAMA_BASE)
         deps = Deps(tools=tool_map, llm_no_tools=llm_plain, macro_planner=macro_planner, constraint_planner=constraint_planner,
                     detail_planner=detail_planner, decomposer_planner=decomposer_planner)

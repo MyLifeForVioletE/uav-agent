@@ -2,8 +2,6 @@
 子任务分配器：将子任务分配到具体UAV
 """
 import sys
-import requests
-from core.config import OLLAMA_BASE, MODEL
 from core.fleet_config import SubTask, UAVConfig
 
 
@@ -133,72 +131,3 @@ class TaskAllocator:
                 score += 3.0
         
         return max(score, 0.0)
-    
-    def allocate_with_llm(
-        self, 
-        sub_tasks: list[SubTask], 
-        uav_configs: list[UAVConfig],
-        scenario: str
-    ) -> dict[str, list[str]]:
-        """使用LLM辅助分配（复杂场景）"""
-        # 构建分配prompt
-        task_desc = "\n".join([
-            f"- {t.task_id}: {t.task_name} (角色要求: {t.assigned_uav_role or '无'}, "
-            f"依赖: {t.prerequisite_tasks})"
-            for t in sub_tasks
-        ])
-        
-        uav_desc = "\n".join([
-            f"- {u.uav_id}: 角色={u.role.value}, 能力={u.capabilities}"
-            for u in uav_configs
-        ])
-        
-        prompt = f"""你是任务分配专家。将以下子任务分配给无人机。
-
-任务列表：
-{task_desc}
-
-无人机列表：
-{uav_desc}
-
-场景：{scenario}
-
-请以JSON格式返回分配方案：
-{{
-    "assignments": {{
-        "UAV_1": ["task_id_1", "task_id_2"],
-        "UAV_2": ["task_id_3"]
-    }}
-}}
-
-只返回JSON，不要其他内容。"""
-        
-        try:
-            resp = requests.post(
-                f"{OLLAMA_BASE}/api/chat",
-                json={
-                    "model": MODEL,
-                    "messages": [
-                        {"role": "user", "content": prompt},
-                    ],
-                    "stream": False,
-                    "options": {"temperature": 0, "num_predict": 4096},
-                },
-                timeout=60,
-            )
-            resp.raise_for_status()
-            content = resp.json()["message"]["content"]
-            
-            # 解析JSON
-            import json
-            import re
-            m = re.search(r'\{.*\}', content, re.DOTALL)
-            if m:
-                data = json.loads(m.group(0))
-                return data.get("assignments", {})
-        except Exception as e:
-            sys.stderr.write(f"[Allocator] LLM分配失败: {e}\n")
-            sys.stderr.flush()
-        
-        # 回退到规则分配
-        return self.allocate(sub_tasks, uav_configs)

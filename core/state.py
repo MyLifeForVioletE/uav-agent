@@ -56,16 +56,12 @@ class AgentState(TypedDict, total=False):
     
     # --- 跨机协作 ---
     shared_results: dict             # {task_id: result_data} 已完成子任务的共享结果
-    inter_uav_dependencies: list     # [{from_uav, to_uav, depends_on_task, data_key}]
-    coordination_decisions: list     # 协调器的决策记录
     
     # --- 消息总线（Kafka）---
     coordinator_mailbox: list        # 指挥 agent 收到的消息列表（子agent上报/请示归档）
 
     # --- Coordinator 内部状态 ---
     _coordinator_intent: str         # coordinator 层级意图分类结果
-    _fleet_plan_generated: bool      # 是否已生成舰队级规划
-    _fleet_plan_confirmed: bool      # 用户是否已确认舰队级规划
     _fleet_all_done: bool            # 所有子agent是否已完成
     _active_conflicts: list          # 当前活跃的冲突列表
     _sub_agents_initialized: bool    # 子agent是否已初始化
@@ -120,12 +116,8 @@ def default_agent_state() -> AgentState:
         "active_uav_ids": [],
         "uav_states": {},
         "shared_results": {},
-        "inter_uav_dependencies": [],
-        "coordination_decisions": [],
         "coordinator_mailbox": [],
         "_coordinator_intent": "",
-        "_fleet_plan_generated": False,
-        "_fleet_plan_confirmed": False,
         "_fleet_all_done": False,
         "_active_conflicts": [],
         "_sub_agents_initialized": False,

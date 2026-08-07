@@ -15,6 +15,7 @@ from core.prompts import SYSTEM_PROMPT
 from core.redis_manager import get_redis_manager
 from agent.coordinator import build_coordinator_graph
 from rag import TaskPlanner
+from tools.stub_tools import merge_stub_tools
 
 
 async def main():
@@ -38,9 +39,9 @@ async def main():
     print("  [连接 MCP Server...]", flush=True)
 
     async with client.session("mcp-server") as session:
-        # 从 MCP server 获得算法工具（field_strength_calc, rf_model_training, rf_model_predict）
+        # 从 MCP server 获得算法工具（仅注册真实执行 exe 的 path_planning）
         algo_tools = await load_mcp_tools(session)
-        print(f"  已注册 {len(algo_tools)} 个算法工具:", flush=True)
+        print(f"  MCP 真实工具 {len(algo_tools)} 个:", flush=True)
         for t in algo_tools:
             print(f"    - {t.name}", flush=True)
 
@@ -72,9 +73,10 @@ async def main():
         detail_planner.index_docs()
         decomposer_planner.index_docs()
 
-        # 合并工具
-        all_tools = algo_tools
-        print(f"  已注册 {len(algo_tools)} 个算法工具", flush=True)
+        # 合并工具：MCP 仅提供真实执行 exe 的 path_planning，其余算法用本地 stub 工具补齐能力
+        all_tools = merge_stub_tools(algo_tools)
+        tool_map = {t.name: t for t in all_tools}
+        print(f"  已注册 {len(tool_map)} 个算法工具（真实 exe: path_planning, 其余为本地 stub)", flush=True)
         print(f"  场景规划器 ({macro_planner.doc_count} 条) + 约束规划器 ({constraint_planner.doc_count} 条) + 详细规划器 ({detail_planner.doc_count} 条)", flush=True)
         print("=" * 60, flush=True)
         print("  模型随时根据你的需求选择合适的算法调用", flush=True)

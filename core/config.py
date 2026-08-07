@@ -19,4 +19,3 @@ KAFKA_BOOTSTRAP_SERVERS = "127.0.0.1:9092"
 
 # Agent ID 常量
 COORDINATOR_ID = "_coordinator_"
-INFO_PROCESSOR_ID = "_info_processor_"
