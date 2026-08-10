@@ -22,9 +22,9 @@ async def execute_external(action: dict, context: dict) -> dict:
     sys.stderr.flush()
 
     # TODO: 实现与外部无人机系统的实际交互
-    # 目前返回 stub 结果
+    # 外部动作无算法产出，output 置空（脚本/状态中不写执行结果文本）
     return {
         "success": True,
-        "output": f"外部动作 {action_name} 执行成功（stub）",
+        "output": "",
         "error": ""
     }

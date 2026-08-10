@@ -35,8 +35,8 @@
                     },
                     "executor": {
                         "type": "string",
-                        "enum": ["coordinator", "uav", "info_processor"],
-                        "description": "执行者：uav=无人机子agent执行，info_processor=信息处理agent执行，coordinator=主agent执行（仅限最终决策）"
+                        "enum": ["coordinator", "uav", "processor"],
+                        "description": "执行者：uav=无人机子agent执行，processor=信息处理agent执行，coordinator=主agent执行（仅限最终决策）"
                     },
                     "assigned_uav_role": {
                         "type": "string",

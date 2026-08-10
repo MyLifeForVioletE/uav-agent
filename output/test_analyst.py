@@ -56,12 +56,12 @@ async def main():
             "task_id": "T2",
             "task_name": "信息处理agent分析扫频数据",
             "goal": "分析扫频数据以获取目标的频率、带宽、信号强度",
-            "executor": "info_processor",
+            "executor": "processor",
             "prerequisite_tasks": ["T1"],
             "prerequisite_results": {"T1": {"output": "外部动作 沿航线返航 执行成功（stub）"}},
         }
 
-        agent = SubAgent("_info_processor_", deps, mode="info_processor",
+        agent = SubAgent("_processor_", deps, mode="processor",
                          redis_mgr=redis_mgr, session_id=session_id)
         agent.assign_task(task)
         await agent.run_step()

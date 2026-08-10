@@ -278,7 +278,7 @@ def task_decomposer_node(state: AgentState, deps: Deps) -> AgentState:
 - scenario: 对本次任务场景的一句话概括，如"单架无人机对单个目标进行侦察"
 - task_name: 子任务的动作名称，直接用用户说的动作词，注意加上对象，如"无人机1侦察目标2""信息处理agent分析目标1带宽、场强""无人机2对目标1实施干扰"
 - goal: 子任务的具体目标，写明该子任务要产出什么。采集类子任务写原始数据（如"获取目标的扫频数据"），分析类子任务写最终期望信息（如"获取目标的频率、带宽、信号强度"）。**不同子任务的 goal 不要互相重复**。
-- executor: "uav"=无人机agent执行，"info_processor"=信息处理agent执行
+- executor: "uav"=无人机agent执行，"processor"=信息处理agent执行
 - assigned_uav_role: 无人机角色，scout=侦察，jammer=干扰
 - prerequisite_tasks: 前置依赖的任务ID列表，没有依赖则填[]
 - constraints: 约束条件，没有则填[]
@@ -309,24 +309,24 @@ assigned_uav_role 必须与用户说的无人机类型一致。
   - 实施干扰
   - 任何需要物理执行、采集原始数据的任务
   - 以上【可用的算法工具】中"角色归属"含 uav 的算法，应由无人机agent执行
-- "info_processor"：由信息处理agent执行。适用于：
+- "processor"：由信息处理agent执行。适用于：
   - 对无人机采集的数据进行分析处理（如扫频数据、信号强度分析、带宽/频率估计）
   - 数据汇总、统计、格式化输出
   - 任何基于无人机采集数据的分析计算任务
-  - 以上【可用的算法工具】中"角色归属"含 info_processor 的算法，应由信息处理agent执行
+  - 以上【可用的算法工具】中"角色归属"含 processor 的算法，应由信息处理agent执行
   - 注意：如果该处理任务依赖无人机的采集结果，必须把对应的采集子任务填进 prerequisite_tasks
 
 注意：
 1. **用户说的每一个执行动作都必须生成对应的子任务**。用户说了"侦察"，就必须有侦察子任务；说了"分析数据"，就必须有分析子任务；说了"干扰"，就必须有干扰子任务。
 2. 如果任务涉及多个目标位置、多个目标对象或多个执行主体，应拆分为多个子任务。
 3. **禁止过度拆分（最重要的规则）**：
-   - 允许且必要：采集(uav)与分析(info_processor)拆成两个子任务（执行主体不同，且分析任务依赖采集结果填 prerequisite_tasks）。
+   - 允许且必要：采集(uav)与分析(processor)拆成两个子任务（执行主体不同，且分析任务依赖采集结果填 prerequisite_tasks）。
    - **绝对禁止**：拆出单独的"飞行/前往/返航"子任务。飞行是侦察/采集动作的一部分，必须并入对应的采集子任务。
    - 反例（错误做法）：T1=无人机飞往目标位置（goal：飞行至目标位置70,15.01）；T2=无人机进行扫频侦察（goal：获取目标的扫频数据）。
    - 正例（正确做法）：T1=无人机飞抵目标位置执行扫频侦察（goal：飞行至目标位置并获取目标的扫频数据）；T2=信息处理agent分析扫频数据。
    - 判断标准：拆分后的每个子任务必须执行主体不同、或面向不同目标、或产出不同信息；只是"先飞到再侦察"不构成拆分理由。
 4. 每个子任务的 goal 必须包含该子任务期望获取的**所有信息**，不能遗漏。
-5. 只有用户明确说了分析/计算/评估类动作（如"分析""计算""评估"），或子任务需要调用分析类算法产出最终结果时，才生成 info_processor 子任务。
+5. 只有用户明确说了分析/计算/评估类动作（如"分析""计算""评估"），或子任务需要调用分析类算法产出最终结果时，才生成 processor 子任务。
 6. 返回前自查一遍：如果发现某个子任务只描述"飞行/前往/返航/抵达"而没有信息产出，把它并入相关的采集子任务后再输出。**输出中不允许存在这种子任务**。
 
 只返回JSON，不要其他内容。"""
@@ -484,15 +484,15 @@ def task_allocator_node(state: AgentState, deps: Deps) -> AgentState:
     # 执行分配
     assignments = allocator.allocate(uav_task_objects, uav_configs)
     
-    # 为 info_processor 任务添加标记（其余非 uav 任务兜底交给信息处理 agent）
+    # 为 processor 任务添加标记（其余非 uav 任务兜底交给信息处理 agent）
     for task in sub_tasks:
         if task.get("executor") != "uav":
-            assignments.setdefault("info_processor", []).append(task.get("task_id", ""))
+            assignments.setdefault("processor", []).append(task.get("task_id", ""))
 
     state["sub_task_assignments"] = assignments
 
-    # 初始化活跃 UAV 列表（不含 info_processor）
-    state["active_uav_ids"] = [k for k in assignments.keys() if k != "info_processor"]
+    # 初始化活跃 UAV 列表（不含 processor）
+    state["active_uav_ids"] = [k for k in assignments.keys() if k != "processor"]
     
     # 生成分配展示文本
     output = "=" * 60 + "\n"
@@ -511,7 +511,7 @@ def task_allocator_node(state: AgentState, deps: Deps) -> AgentState:
             # 找到分配的 UAV
             assignee = "未分配"
             for uav_id, task_ids in assignments.items():
-                if task_id in task_ids and uav_id not in ("coordinator", "info_processor"):
+                if task_id in task_ids and uav_id not in ("coordinator", "processor"):
                     assignee = uav_id
                     break
             # 显示角色信息
@@ -568,8 +568,8 @@ async def fleet_dispatcher_node(state: AgentState, deps: Deps) -> AgentState:
             task_id = state["_sub_awaiting"]
             agent_id = fleet_mgr.task_to_agent.get(task_id)
             if agent_id:
-                if agent_id == FleetManager._INFO_PROCESSOR_ID:
-                    fleet_mgr._info_processor_agent.inject_user_input(state["user_input"])
+                if agent_id == FleetManager._PROCESSOR_ID:
+                    fleet_mgr._processor_agent.inject_user_input(state["user_input"])
                 else:
                     agent = fleet_mgr.sub_agents.get(agent_id)
                     if agent:
@@ -605,7 +605,7 @@ async def fleet_dispatcher_node(state: AgentState, deps: Deps) -> AgentState:
         else:
             executor_label = "未分配"
             for uav_id, task_ids in assignments.items():
-                if task_id in task_ids and uav_id != "info_processor":
+                if task_id in task_ids and uav_id != "processor":
                     executor_label = uav_id
                     break
         

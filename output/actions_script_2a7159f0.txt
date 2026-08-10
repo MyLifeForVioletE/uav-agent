@@ -1,9 +1,0 @@
-[UAV_1 无人机Agent 步骤 1/8] 规划航线 | path_planning(startPositionLong=70, startPositionLat=15, destinationLong=70, destinationLat=15.01, map=c:\Users\EHz\Desktop\uavAgentPlanning\knowledge\LAYERDESCRIPTIONFILE.LDF, bilndArea=c:\Users\EHz\Desktop\uavAgentPlanning\knowledge\blind.txt, CoverageArea=c:\Users\EHz\Desktop\uavAgentPlanning\knowledge\clear.txt)  => (70,15,0,0),(70,15.0011,111.111,6.66667),(70,15.0022,200,13.3333),(70,15.0033,200,20),(70,15.0044,200,26.6667),(70,15.0056,200,33.3333),(70,15.0067,200,40),(70,15.0078,200,46.6667),(70,15.0089,200,53.3333),(70,15.01,200,60)
-[UAV_1 无人机Agent 步骤 2/8] 完成自检并起飞 | 完成自检并起飞  => 外部动作 完成自检并起飞 执行成功（stub）
-[UAV_1 无人机Agent 步骤 3/8] 爬升至搜索巡航高度 | 爬升至搜索巡航高度  => 外部动作 爬升至搜索巡航高度 执行成功（stub）
-[UAV_1 无人机Agent 步骤 4/8] 沿航线飞行至目标 | 沿航线飞行至目标  => 外部动作 沿航线飞行至目标 执行成功（stub）
-[UAV_1 无人机Agent 步骤 5/8] 启动扫频设备 | 启动扫频设备  => 外部动作 启动扫频设备 执行成功（stub）
-[UAV_1 无人机Agent 步骤 6/8] 获取扫频数据 | sweepFrequencyReconnaissance(target_frequency=1, step=500)  => 输出;sweepData
-[UAV_1 无人机Agent 步骤 7/8] 规划返航航线 | path_planning(startPositionLong=70, startPositionLat=15.01, destinationLong=70, destinationLat=15, map=c:\Users\EHz\Desktop\uavAgentPlanning\knowledge\LAYERDESCRIPTIONFILE.LDF, bilndArea=c:\Users\EHz\Desktop\uavAgentPlanning\knowledge\blind.txt, CoverageArea=c:\Users\EHz\Desktop\uavAgentPlanning\knowledge\clear.txt)  => (70,15.01,0,0),(70,15.0089,111.111,6.66667),(70,15.0078,200,13.3333),(70,15.0067,200,20),(70,15.0056,200,26.6667),(70,15.0044,200,33.3333),(70,15.0033,200,40),(70,15.0022,200,46.6667),(70,15.0011,200,53.3333),(70,15,200,60)
-[_info_processor_ 分析Agent 步骤 1] signalAnalysis | signalAnalysis(sweepData=sweepData)  => 输出;tFreq, tBand, tStre
-[UAV_1 无人机Agent 步骤 8/8] 沿航线返航 | 沿航线返航  => 外部动作 沿航线返航 执行成功（stub）

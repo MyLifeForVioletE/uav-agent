@@ -19,7 +19,7 @@ from agent.analyst_graph import build_analyst_graph
 
 class SendMessageInput(BaseModel):
     """send_message 工具参数"""
-    to: str = Field(description="接收方 agent ID：指挥 agent 为 _coordinator_，无人机为 UAV_1 等，信息处理 agent 为 _info_processor_")
+    to: str = Field(description="接收方 agent ID：指挥 agent 为 _coordinator_，无人机为 UAV_1 等，信息处理 agent 为 _processor_")
     msg_type: str = Field(description="消息类型：report=向指挥上报状态/结果，request=向指挥请示问题并等待回复，instruction=向其它 agent 下发指令")
     content: str = Field(description="消息内容（用自然中文）")
     await_reply: bool = Field(default=False, description="msg_type=request 时设为 true，表示要等待指挥回复后再继续")
@@ -30,7 +30,7 @@ class SubAgent:
     
     支持两种模式：
     - "uav"：无人机子 agent，生成 UAV 专属的任务描述
-    - "info_processor"：信息处理 agent，生成对无人机采集数据的分析处理类任务描述
+    - "processor"：信息处理 agent，生成对无人机采集数据的分析处理类任务描述
     """
     
     def __init__(self, agent_id: str, deps, initial_config: dict = None, mode: str = "uav", redis_mgr: RedisManager = None, session_id: str = "default"):
@@ -40,7 +40,7 @@ class SubAgent:
         self.redis_mgr = redis_mgr
         self._session_id = session_id
         # 分析 agent 用 3 节点极简图；其余复用 6 节点单机图
-        self.graph = build_analyst_graph(self.deps) if mode == "info_processor" else build_graph(self.deps)
+        self.graph = build_analyst_graph(self.deps) if mode == "processor" else build_graph(self.deps)
         self.state = self._init_state()      # 独立状态实例
         self.status = "idle"                  # idle | running | done | error
         self.progress = 0.0
@@ -68,7 +68,7 @@ class SubAgent:
         """按 mode 过滤可用工具表，其余依赖（规划器/LLM）保持不变"""
         tools = filter_tools_for_role(deps.tools, self.mode)
         # 子 agent（UAV / 信息处理）额外提供 send_message 通信工具
-        if self.mode in ("uav", "info_processor"):
+        if self.mode in ("uav", "processor"):
             tools = {**tools, "send_message": self._make_send_message_tool()}
         return Deps(
             tools=tools,
@@ -81,7 +81,7 @@ class SubAgent:
 
     def _init_state(self) -> AgentState:
         """初始化子agent的独立状态"""
-        is_analyst = self.mode == "info_processor"
+        is_analyst = self.mode == "processor"
         return {
             "messages": [SystemMessage(content=ANALYST_SYSTEM_PROMPT if is_analyst else SYSTEM_PROMPT)],
             "user_input": None,
@@ -209,7 +209,7 @@ class SubAgent:
                 pass
         
         # 根据模式构造不同描述
-        if self.mode == "info_processor":
+        if self.mode == "processor":
             task_desc = (
                 f"你是信息处理 agent。请根据以下分析子任务，从可用算法工具中选择最匹配的算法，"
                 f"从任务描述、上下文或前置任务结果中提取所需参数，然后直接调用该算法工具。\n"
@@ -255,7 +255,7 @@ class SubAgent:
             return
 
         # 分析 agent：直接跑一次分析图即完成（无规划/无用户确认）
-        if self.mode == "info_processor":
+        if self.mode == "processor":
             try:
                 self.state = await self.graph.ainvoke(self.state, {"recursion_limit": 50})
                 self.last_output = self.state.get("output", "")
@@ -450,7 +450,8 @@ class SubAgent:
             "step_idx": idx,
             "total": total,
             "success": result.get("success", False),
-            "output": str(result.get("output", ""))[:500],
+            "output": str(result.get("output", ""))[:4000],
+            "output_fields": result.get("output_fields") or [],
         })
 
     async def _send_report(self, report_type: str, extra: dict = None):

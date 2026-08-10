@@ -12,6 +12,7 @@ from core.redis_manager import RedisManager
 from core.config import BASE_DIR, COORDINATOR_ID
 from core.kafka_bus import get_kafka_bus
 from agent.sub_agent import SubAgent
+from tools.script_writer import write_action_step, write_pause_marker, refresh_dependencies_with_llm
 
 
 def _load_algorithm_list_text() -> str:
@@ -56,7 +57,7 @@ class FleetManager:
     """Fleet 管理器：协调多个子agent的生命周期"""
     
     _COORD_ID = "_coordinator_"
-    _INFO_PROCESSOR_ID = "_info_processor_"
+    _PROCESSOR_ID = "_processor_"
 
     def __init__(self, deps: Deps, redis_mgr: RedisManager = None):
         self.deps = deps
@@ -68,7 +69,7 @@ class FleetManager:
         self._planned_tasks: set = set()              # 已规划但未执行的任务
         self._saved_plans: dict = {}                  # task_id → {detail_actions}
         self._phase: str = "planning"                 # "planning" | "execution"
-        self._info_processor_agent: SubAgent | None = None  # 信息处理类子任务的 agent
+        self._processor_agent: SubAgent | None = None  # 信息处理类子任务的 agent
         self._bus = get_kafka_bus()
     
     def initialize_sub_agents(self, state: AgentState):
@@ -91,14 +92,14 @@ class FleetManager:
                 self.task_to_agent[tid] = uav_id
 
         # 创建信息处理 agent（基于无人机采集数据的分析处理类子任务）
-        self._info_processor_agent = SubAgent(
-            agent_id=self._INFO_PROCESSOR_ID, deps=self.deps,
-            initial_config={}, mode="info_processor", redis_mgr=self.redis_mgr, session_id=session_id
+        self._processor_agent = SubAgent(
+            agent_id=self._PROCESSOR_ID, deps=self.deps,
+            initial_config={}, mode="processor", redis_mgr=self.redis_mgr, session_id=session_id
         )
-        ip_task_ids = assignments.get("info_processor", [])
-        self._info_processor_agent._assigned_task_ids = ip_task_ids
+        ip_task_ids = assignments.get("processor", [])
+        self._processor_agent._assigned_task_ids = ip_task_ids
         for tid in ip_task_ids:
-            self.task_to_agent[tid] = self._INFO_PROCESSOR_ID
+            self.task_to_agent[tid] = self._PROCESSOR_ID
 
     # ── 指挥 agent 收件箱：处理子 agent 的上报/请示/结果 ─────────────
 
@@ -204,63 +205,19 @@ class FleetManager:
                 sys.stderr.write(f"[Fleet] 规划记录落 Redis 失败: {e}\n")
                 sys.stderr.flush()
 
-    def _script_path(self, session_id: str) -> str:
-        """统一任务脚本路径：整个任务写入同一个文件"""
-        out_dir = BASE_DIR / "output"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        return out_dir / f"actions_script_{session_id}.txt"
-
     def _finalize_script_segment(self, state: AgentState, reason: str = ""):
         """在统一脚本中写入暂停标记（整个任务仍写入同一个文件）"""
-        session_id = state.get("session_id", "default")
-        try:
-            script_path = self._script_path(session_id)
-            with open(script_path, "a", encoding="utf-8") as f:
-                f.write(f"# === 暂停 === {reason}\n" if reason else "# === 暂停 ===\n")
-            sys.stderr.write(f"[Fleet] 脚本暂停标记: {script_path} :: {reason}\n")
-            sys.stderr.flush()
-        except Exception as e:
-            sys.stderr.write(f"[Fleet] 脚本暂停标记写入失败: {e}\n")
-            sys.stderr.flush()
+        write_pause_marker(state.get("session_id", "default"), reason)
 
     def _write_action_script_line(self, state: AgentState, msg: dict):
-        """把已执行的动作 + 实际调用参数值写入脚本文件（txt，每行一个动作）"""
+        """把已执行的动作 + 实际调用参数值写入脚本文件（JSON，steps 中追加一条）"""
         payload = msg.get("payload") or {}
         from_id = msg.get("from", "")
         session_id = state.get("session_id", "default")
         action = payload.get("action", {}) or {}
-        step_idx = payload.get("step_idx", 0)
-        total = payload.get("total", 0)
-
-        action_name = action.get("action_name", "")
-        tool_name = action.get("tool_name", action.get("action_name", ""))
-        tool_inputs = action.get("tool_inputs", {}) or {}
-        params = ", ".join(f"{k}={v}" for k, v in tool_inputs.items() if str(v).strip())
         output = payload.get("output", "") or ""
-
-        agent_label = "分析Agent" if from_id == self._INFO_PROCESSOR_ID else "无人机Agent"
-        # total=0 表示分析 agent（总步骤不定，只显示连续步骤号）；否则显示 N/total
-        step_info = f"步骤 {step_idx+1}" if total <= 0 else f"步骤 {step_idx+1}/{total}"
-        line = f"[{from_id} {agent_label} {step_info}] {action_name or (tool_name if tool_name else '未知动作')}"
-        if tool_name and params:
-            line += f" | {tool_name}({params})"
-        elif tool_name:
-            line += f" | {tool_name}"
-        if output:
-            out_summary = output.strip().replace("\n", " ")
-            if len(out_summary) > 300:
-                out_summary = out_summary[:300] + "...(截断)"
-            line += f"  => {out_summary}"
-
-        try:
-            script_path = self._script_path(session_id)
-            with open(script_path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-            sys.stderr.write(f"[Fleet] 已写入脚本文件: {script_path} :: {line}\n")
-            sys.stderr.flush()
-        except Exception as e:
-            sys.stderr.write(f"[Fleet] 脚本文件写入失败: {e}\n")
-            sys.stderr.flush()
+        output_fields = payload.get("output_fields") or []
+        write_action_step(session_id, from_id, action, action.get("tool_inputs", {}), output, output_fields)
 
     async def _handle_coordinator_request(self, state: AgentState, msg: dict):
         """子 agent 请示：缺参请求走专项处理；其余交指挥 LLM 决策"""
@@ -781,7 +738,7 @@ class FleetManager:
         # 首次 tick：清空各收件箱残留消息（此时本会话尚未产生任何消息，安全）
         if self._bus and state.get("_fleet_tick_count", 0) == 0:
             await self._bus.flush_inbox(self._COORD_ID)
-            for agent_id in list(self.sub_agents) + [self._INFO_PROCESSOR_ID]:
+            for agent_id in list(self.sub_agents) + [self._PROCESSOR_ID]:
                 await self._bus.flush_inbox(agent_id)
 
         # 先处理指挥 agent 收件箱（子 agent 的上报/请示/结果）
@@ -876,9 +833,9 @@ class FleetManager:
             state["_current_task_idx"] = current_task_idx + 1
             return
         
-        # 获取对应的 agent（UAV 子 agent / info_processor）
-        if agent_id == self._INFO_PROCESSOR_ID:
-            agent = self._info_processor_agent
+        # 获取对应的 agent（UAV 子 agent / processor）
+        if agent_id == self._PROCESSOR_ID:
+            agent = self._processor_agent
         else:
             agent = self.sub_agents.get(agent_id)
         
@@ -887,11 +844,11 @@ class FleetManager:
             state["_current_task_idx"] = current_task_idx + 1
             return
 
-        is_info_task = agent_id == self._INFO_PROCESSOR_ID
+        is_processor_task = agent_id == self._PROCESSOR_ID
 
         # 信息处理任务：规划阶段不运行分析 agent（无宏观/详细规划），直接视为已规划，
         # 执行阶段（前置采集任务完成后）再跑分析图直接调工具完成
-        if is_info_task and self._phase == "planning":
+        if is_processor_task and self._phase == "planning":
             self._planned_tasks.add(task_id)
             self._running_tasks.discard(task_id)
             state["_current_task_idx"] = current_task_idx + 1
@@ -969,7 +926,7 @@ class FleetManager:
             _actual_ui = agent.state.get("user_input", "")
             
             # 子agent有等待用户确认的问题，传播到 coordinator（信息处理任务除外，输出即完成）
-            if (agent.has_pending_question or _actual_pq) and not is_info_task:
+            if (agent.has_pending_question or _actual_pq) and not is_processor_task:
                 if not agent.has_pending_question:
                     print(f"[DEBUG tick] has_pending_question=False but state.pending_question='{_actual_pq[:50]}' (fallback)", file=sys.stderr, flush=True)
                 state["_sub_awaiting"] = task_id
@@ -998,6 +955,15 @@ class FleetManager:
                         "progress": 1.0,
                         "detail_actions": agent.state.get("detail_actions", []),
                     }
+                # 任务完成：LLM 兜底补全字段血缘依赖（无未匹配字段时零开销直接返回）
+                try:
+                    await refresh_dependencies_with_llm(
+                        state.get("session_id", "default"),
+                        self.deps.llm_no_tools if self.deps else None,
+                    )
+                except Exception as e:
+                    sys.stderr.write(f"[Fleet] LLM 依赖兜底失败: {e}\n")
+                    sys.stderr.flush()
                 
                 self._running_tasks.discard(task_id)
                 agent.reset_for_next_task()
@@ -1030,9 +996,9 @@ class FleetManager:
                 "detail_actions": agent.state.get("detail_actions", []),
             }
 
-        if self._info_processor_agent:
-            ip = self._info_processor_agent
-            results["info_processor_results"] = {
+        if self._processor_agent:
+            ip = self._processor_agent
+            results["processor_results"] = {
                 "status": ip.status,
                 "progress": ip.progress,
                 "output": ip.last_output,

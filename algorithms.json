@@ -51,17 +51,18 @@
     },
     {
       "name":"communication",
-      "roles":["info_processor"],
+      "roles":["processor"],
       "description":"根据己方通信频率，己方带宽，传输数据大小，对方通信频率，对方带宽来得到通信成功与否标志与通信时长",
       "executor":"tool",
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\communication\\communication.exe",
       "input_schema":{
         "oFreq":{
-          "type":"object",
-          "description":"己方通信频率"
+          "type":"string",
+          "format":"range",
+          "description":"己方通信频率范围（如 1~2GHz）"
         },
         "oBand":{
-          "type":"object",
+          "type":"string",
           "description":"己方带宽"
         },
         "data":{
@@ -69,11 +70,12 @@
           "description":"传输数据大小"
         },
         "tFreq":{
-          "type":"object",
-          "description":"对方通信频率"
+          "type":"string",
+          "format":"range",
+          "description":"对方通信频率范围（如 1~2GHz）"
         },
         "tBand":{
-          "type":"object",
+          "type":"string",
           "description":"对方带宽"
         }
       },
@@ -88,7 +90,7 @@
     },
     {
       "name":"communicationSupport",
-      "roles":["info_processor"],
+      "roles":["processor"],
       "description":"根据通信保障经纬度，通信频率，通信带宽，通信时长，发射功率，跳频方式来给出通信保障结果",
       "executor":"tool",
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\communication_support\\communicationSupport.exe",
@@ -102,11 +104,12 @@
           "description":"通信保障位置纬度"
         },
         "freq":{
-          "type":"object",
-          "description":"通信频率"
+          "type":"string",
+          "format":"range",
+          "description":"通信频率范围（如 1~2GHz）"
         },
         "band":{
-          "type":"object",
+          "type":"string",
           "description":"通信带宽"
         },
         "time":{
@@ -118,7 +121,7 @@
           "description":"发射功率"
         },
         "type":{
-          "type":"object",
+          "type":"string",
           "description":"跳频方式"
         }
       },
@@ -139,11 +142,12 @@
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\direction_finding\\directionFinding.exe",
       "input_schema":{
         "freq":{
-          "type":"object",
-          "description":"目标频率"
+          "type":"string",
+          "format":"range",
+          "description":"目标频率范围（如 1~2GHz）"
         },
         "band":{
-          "type":"object",
+          "type":"string",
           "description":"目标带宽"
         }
       },
@@ -176,15 +180,16 @@
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\jamming\\jamming.exe",
       "input_schema":{
         "freq":{
-          "type":"object",
-          "description":"目标频率"
+          "type":"string",
+          "format":"range",
+          "description":"目标频率范围（如 1~2GHz）"
         },
         "power":{
           "type":"object",
           "description":"干扰功率"
         },
         "type":{
-          "type":"object",
+          "type":"string",
           "description":"干扰样式"
         },
         "time":{
@@ -203,7 +208,7 @@
     },
     {
       "name":"positionAnalysis",
-      "roles":["info_processor"],
+      "roles":["processor"],
       "description":"根据目标的在不同位置测量到的两组经纬高和信号强度数据得到目标经纬度和发射功率",
       "executor":"tool",
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\position_analysis\\positionAnalysis.exe",
@@ -260,14 +265,15 @@
     },
     {
       "name":"recommendCommPosition",
-      "roles":["info_processor"],
+      "roles":["processor"],
       "description":"根据通信频率和盲区信息找出推荐的通信保障位置经纬度",
       "executor":"tool",
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\recommend_comm_position\\recommendCommPosition.exe",
       "input_schema":{
         "freq":{
-          "type":"object",
-          "description":"通信频率"
+          "type":"string",
+          "format":"range",
+          "description":"通信频率范围（如 1~2GHz）"
         },
         "blind":{
           "type":"file",
@@ -289,7 +295,7 @@
     },
     {
       "name":"recommendJammingPosition",
-      "roles":["info_processor"],
+      "roles":["processor"],
       "description":"根据目标经纬度，频率，带宽，目标发射功率得到推荐的干扰位置经纬度",
       "executor":"tool",
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\recommend_jamming_position\\recommendJammingPosition.exe",
@@ -303,11 +309,12 @@
           "description":"目标纬度"
         },
         "freq":{
-          "type":"object",
-          "description":"目标频率"
+          "type":"string",
+          "format":"range",
+          "description":"目标频率范围（如 1~2GHz）"
         },
         "band":{
-          "type":"object",
+          "type":"string",
           "description":"目标带宽"
         },
         "power":{
@@ -330,7 +337,7 @@
     },
     {
       "name":"recommendReconnaissancePosition",
-      "roles":["info_processor"],
+      "roles":["processor"],
       "description":"根据目标经纬度和频率得到推荐的侦察位置经纬度",
       "executor":"tool",
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\recommend_reconnaissance_position\\recommendReconnaissancePosition.exe",
@@ -344,8 +351,9 @@
           "description":"目标纬度"
         },
         "freq":{
-          "type":"object",
-          "description":"目标频率"
+          "type":"string",
+          "format":"range",
+          "description":"目标频率范围（如 1~2GHz）"
         }
       },
       "output_schema":{
@@ -363,7 +371,7 @@
     },
     {
       "name":"signalAnalysis",
-      "roles":["info_processor"],
+      "roles":["processor"],
       "description":"根据目标扫频数据得到目标信号频率，带宽和强度",
       "executor":"tool",
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\signal_analysis\\signalAnalysis.exe",
@@ -398,8 +406,9 @@
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\sweep_frequency_reconnaissance\\sweepFrequencyReconnaissance.exe",
       "input_schema":{
         "target_frequency":{
-          "type":"number",
-          "description":"目标频率"
+          "type":"string",
+          "format":"range",
+          "description":"目标频率范围（如 1~2GHz）"
         },
         "step":{
           "type":"number",

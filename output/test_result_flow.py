@@ -78,8 +78,8 @@ async def test_analysis_result_flow(deps, redis_mgr, session_id):
     print("=" * 40, "Test 2: 分析结论→指挥→Redis", "=" * 40)
     bus = get_kafka_bus()
     await bus.flush_inbox(COORDINATOR_ID)
-    await bus.flush_inbox("_info_processor_")
-    agent = SubAgent("_info_processor_", deps, mode="info_processor",
+    await bus.flush_inbox("_processor_")
+    agent = SubAgent("_processor_", deps, mode="processor",
                      redis_mgr=redis_mgr, session_id=session_id)
     agent._current_task = {"task_id": "T2", "goal": "获取目标的频率、带宽、信号强度"}
     agent.last_output = "分析结论：目标频率 1.00003 GHz，带宽 7 MHz，信号强度 -76 dB"

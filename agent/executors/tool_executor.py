@@ -566,6 +566,19 @@ def _parse_waypoints(stdout: str) -> list:
     return waypoints
 
 
+def _extract_output_fields(output: str) -> list:
+    """从 stub 占位输出（"输出;field1, field2"）提取输出字段名列表；非 stub 输出返回空列表。
+
+    stub 工具不调用 exe，stdout 仅为 "输出;field" 字段名列表（值未知），
+    字段名直接交给上层使用，无需保留 "输出;" 前缀。
+    """
+    import re as _re
+    m = _re.fullmatch(r"输出;[\s,，、]*(.*)", str(output or "").strip())
+    if not m:
+        return []
+    return _re.findall(r"[A-Za-z_][A-Za-z0-9_]*", m.group(1))
+
+
 def _write_path_to_redis(redis_mgr, session_id: str, state: dict, tool_inputs: dict, output: str):
     """路径规划成功后，将航迹点写入 Redis 上下文（关联到对应的无人机）。
 
@@ -893,6 +906,7 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
         return {
             "success": True,
             "output": readable,
+            "output_fields": _extract_output_fields(readable),
             "tool_inputs": tool_inputs,
             "error": "",
             "pending": False,

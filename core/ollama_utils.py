@@ -88,7 +88,7 @@ _CAP_ROLES = _load_capability_roles()
 def filter_tools_for_role(tool_map: dict, role: str) -> dict:
     """按 agent 角色过滤工具表
 
-    - role="info_processor"：分析 agent 只能用 algorithms.json 中 roles 含 "info_processor" 的算法工具
+    - role="processor"：分析 agent 只能用 algorithms.json 中 roles 含 "processor" 的算法工具
     - role="uav"：只能用 roles 含 "uav" 的算法工具 + 非注册工具
     """
     result = {}
@@ -96,7 +96,7 @@ def filter_tools_for_role(tool_map: dict, role: str) -> dict:
         roles = _CAP_ROLES.get(name)
         if roles is None:
             # 非 algorithms.json 注册的工具：UAV 可用，分析 agent 不可用
-            if role != "info_processor":
+            if role != "processor":
                 result[name] = tool
         elif role in roles:
             result[name] = tool
