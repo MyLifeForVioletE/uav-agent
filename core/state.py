@@ -74,6 +74,7 @@ class AgentState(TypedDict, total=False):
     recorded_plans: dict              # 指挥记录的 UAV 宏观/详细规划 {agent_id: {...}}
     _awaiting_user_param: dict        # 指挥等待用户提供缺失参数的状态 {agent_id, task_id, params, correlation_id}
     _param_resolve_attempts: dict     # 缺参推导尝试计数 {agent_key: int} 防循环
+    _task_seq: int                    # 任务序号（会话内任务边界自增，用于轮换 task session_id）
 
     # --- 单机图内部状态 ---
     _has_input: bool                  # idle 节点标记：本轮是否有新输入
@@ -130,6 +131,7 @@ def default_agent_state() -> AgentState:
         "recorded_plans": {},
         "_awaiting_user_param": {},
         "_param_resolve_attempts": {},
+        "_task_seq": 0,
         "_has_input": False,
         "_last_input": "",
     }

@@ -150,13 +150,16 @@ def parameter_collector_node(state: AgentState, deps: Deps) -> AgentState:
 要求：
 1. 模板中 uavs 和 targets 是数组类型，用户说了多个就生成多个条目，每条带唯一 id
 2. 用户说"三架无人机"就生成3个uav条目（id=UAV_1~UAV_3），没说的字段保持空值
-3. 用户说"两个目标"就生成2个 target 条目（id=T1~T2），没说的字段保持空值
-4. **"无人机到位置X"**表示该无人机的任务目标是该位置，应填入对应 target 的 Longitude 和 Latitude，**不影响该无人机的 Longitude/Latitude**
+3. **targets 的数量严格等于用户说出的目标个数**：用户说"一个通信目标"，即使它在多个位置被观测，targets 也只生成 1 条（id=T1）；说"两个目标"才生成 2 条（id=T1~T2）
+4. **区分"目标位置"和"观测位置"**：
+   - 只有用户明确说出目标自身的位置（如"目标在XX""目标位置是XX"）时，才填入对应 target 的 Longitude 和 Latitude
+   - "无人机到位置X侦察"里的位置X是**观测位置**（该无人机前往测量的地点），应填入对应无人机的 mission_position 字段（坐标字符串，如 "70,15.01"），**不影响该无人机的 Longitude/Latitude**（仍为基地坐标）
+   - **若同一位置既是目标自身位置、又是某无人机前往的观测位置，则 target 经纬度和该无人机的 mission_position 都要填**
 5. **"基地坐标"或"无人机在XX"**才决定无人机的 Longitude/Latitude，所有无人机在基地则 Longitude/Latitude=基地坐标
-6. **"位置X的坐标是XX"**填入对应 target 的 Longitude 和 Latitude
+6. **"位置X的坐标是XX"**：若 X 是目标自身位置，填入对应 target 的经纬度；若 X 是无人机前往的观测位置，填入对应无人机的 mission_position；两种情况同时成立则两处都填。多架无人机分别去多个位置时按顺序对应（如 UAV_1→位置1，UAV_2→位置2）
 7. 不要删除已有上下文中已有的条目和字段
 8. 输出完整的 JSON，包含所有需要保留的字段
-9. **禁止输出模板中不存在的字段（如 position、x、y）**；坐标必须写成 Longitude 和 Latitude 两个字段，输出前检查一遍确保没有 position 字段
+9. **模板允许的字段**：uavs 为 id/Longitude/Latitude/mission_position；targets 为 id/Longitude/Latitude/Frequency/frequency_step；base 为 Longitude/Latitude。**禁止输出模板中不存在的字段（如 position、x、y）**；坐标必须写成 Longitude 和 Latitude 两个字段，输出前检查一遍确保没有 position 字段
 
 只输出 JSON 对象，不要输出其他内容。"""
     
@@ -282,6 +285,8 @@ def task_decomposer_node(state: AgentState, deps: Deps) -> AgentState:
 - assigned_uav_role: 无人机角色，scout=侦察，jammer=干扰
 - prerequisite_tasks: 前置依赖的任务ID列表，没有依赖则填[]
 - constraints: 约束条件，没有则填[]
+
+【重要】观测位置说明：任务描述中"位置X"（如"无人机到位置1侦察"）是无人机要前往的观测位置，其坐标（如"位置1的坐标是70，15.01"）**必须写进对应 uav 采集子任务的 goal 中**，写明具体坐标（如"飞行至位置70,15.01进行扫频侦察"），供子 agent 飞行使用。同一目标被多个位置观测时，每个位置分别对应一架无人机的采集子任务，但都属于同一个目标。
 
 请以JSON格式返回任务分解方案：
 {{
@@ -678,7 +683,40 @@ def result_aggregator_node(state: AgentState, deps: Deps) -> AgentState:
     state["_sub_awaiting"] = ""
     state["_coordinator_intent"] = ""
     state["pending_question"] = ""
-    
+
+    # 任务边界：清空本任务的分解/分配/配置/结果，使下一次用户输入作为全新场景
+    # 重新走 router → parameter_collector → task_decomposer → task_allocator 流水线，
+    # 否则 coordinator_idle 会看到残留的 sub_task_assignments 而直接 go_dispatcher 复用旧任务。
+    state["sub_tasks"] = []
+    state["sub_task_assignments"] = {}
+    state["uav_configs"] = []
+    state["active_uav_ids"] = []
+    state["shared_results"] = {}
+    state["original_scenario"] = ""
+    state["_current_task_idx"] = 0
+    state["_last_collected_input"] = ""
+    state["_awaiting_user_param"] = None
+    state["_fleet_manager"] = None
+    state["recorded_plans"] = {}
+    state["uav_count"] = 0
+
+    # 任务边界：为下一个任务轮换 task session_id（<base>-t<seq>）。
+    # 下游全部从 state["session_id"] 取键（Redis context、action 脚本文件、子agent），
+    # 因此新任务自动获得干净的 context 与 output/actions_script_<新id>.json，
+    # 而上一任务的 context/脚本按旧 id 归档保留，互不串写。
+    base_id = str(state.get("session_id") or "default").split("-t")[0]
+    seq = int(state.get("_task_seq") or 0) + 1
+    state["_task_seq"] = seq
+    new_session = f"{base_id}-t{seq}"
+    state["session_id"] = new_session
+    try:
+        get_redis_manager().init_context(new_session)
+        sys.stderr.write(f"[ResultAggregator] 任务完成，下一个任务会话: {new_session}\n")
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"[ResultAggregator] 初始化新任务上下文失败: {e}\n")
+        sys.stderr.flush()
+
     return state
 
 

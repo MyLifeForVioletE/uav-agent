@@ -36,7 +36,7 @@ class TaskPlanner:
 
         contexts = []
         for i, item in enumerate(reranked):
-            src = item["metadata"].get("source", "unknown")
+            src = (item.get("metadata") or {}).get("source", "unknown")
             contexts.append(f"[参考 {i + 1}] 来源: {src}\n{item['text']}")
 
         phases = self._extract_phases(chunks=[r["text"] for r in reranked])

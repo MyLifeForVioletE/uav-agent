@@ -9,7 +9,7 @@
                 "startPositionLong": "70",
                 "startPositionLat": "15",
                 "destinationLong": "70",
-                "destinationLat": "15.01",
+                "destinationLat": "15.02",
                 "map": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\LAYERDESCRIPTIONFILE.LDF",
                 "bilndArea": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\blind.txt",
                 "CoverageArea": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\clear.txt"
@@ -25,55 +25,55 @@
                     {
                         "t": 6.66667,
                         "x": 70.0,
-                        "y": 15.0011,
+                        "y": 15.0022,
                         "z": 111.111
                     },
                     {
                         "t": 13.3333,
                         "x": 70.0,
-                        "y": 15.0022,
+                        "y": 15.0044,
                         "z": 200.0
                     },
                     {
                         "t": 20.0,
                         "x": 70.0,
-                        "y": 15.0033,
+                        "y": 15.0067,
                         "z": 200.0
                     },
                     {
                         "t": 26.6667,
                         "x": 70.0,
-                        "y": 15.0044,
+                        "y": 15.0089,
                         "z": 200.0
                     },
                     {
                         "t": 33.3333,
                         "x": 70.0,
-                        "y": 15.0056,
+                        "y": 15.0111,
                         "z": 200.0
                     },
                     {
                         "t": 40.0,
                         "x": 70.0,
-                        "y": 15.0067,
+                        "y": 15.0133,
                         "z": 200.0
                     },
                     {
                         "t": 46.6667,
                         "x": 70.0,
-                        "y": 15.0078,
+                        "y": 15.0156,
                         "z": 200.0
                     },
                     {
                         "t": 53.3333,
                         "x": 70.0,
-                        "y": 15.0089,
+                        "y": 15.0178,
                         "z": 200.0
                     },
                     {
                         "t": 60.0,
                         "x": 70.0,
-                        "y": 15.01,
+                        "y": 15.02,
                         "z": 200.0
                     }
                 ]
@@ -91,79 +91,25 @@
             "step_id": "UAV_1-3",
             "subject_id": "UAV_1",
             "step_type": "external",
-            "step_name": "爬升至搜索巡航高度",
-            "input": {},
-            "output": ""
-        },
-        {
-            "step_id": "UAV_1-4",
-            "subject_id": "UAV_1",
-            "step_type": "external",
-            "step_name": "沿航线飞行至目标位置",
-            "input": {},
-            "output": ""
-        },
-        {
-            "step_id": "UAV_1-5",
-            "subject_id": "UAV_1",
-            "step_type": "external",
-            "step_name": "启动电磁扫频设备",
-            "input": {},
-            "output": ""
-        },
-        {
-            "step_id": "UAV_1-6",
-            "subject_id": "UAV_1",
-            "step_type": "sweepFrequencyReconnaissance",
-            "step_name": "执行扫频数据采集",
+            "step_name": "沿航线飞行",
             "input": {
-                "target_frequency": "2-3GHz",
-                "step": "500"
-            },
-            "output": {
-                "sweepData": "sweepData"
-            }
-        },
-        {
-            "step_id": "UAV_1-7",
-            "subject_id": "UAV_1",
-            "step_type": "system",
-            "step_name": "保存扫频结果",
-            "input": {},
-            "output": "状态保存完成: 保存扫频结果"
-        },
-        {
-            "step_id": "UAV_1-8",
-            "subject_id": "UAV_1",
-            "step_type": "path_planning",
-            "step_name": "规划返航航线",
-            "input": {
-                "startPositionLong": "70",
-                "startPositionLat": "15.01",
-                "destinationLong": "70",
-                "destinationLat": "15",
-                "map": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\LAYERDESCRIPTIONFILE.LDF",
-                "bilndArea": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\blind.txt",
-                "CoverageArea": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\clear.txt"
-            },
-            "output": {
-                "path": [
+                "route": [
                     {
                         "t": 0.0,
                         "x": 70.0,
-                        "y": 15.01,
+                        "y": 15.0,
                         "z": 0.0
                     },
                     {
                         "t": 6.66667,
                         "x": 70.0,
-                        "y": 15.0089,
+                        "y": 15.0022,
                         "z": 111.111
                     },
                     {
                         "t": 13.3333,
                         "x": 70.0,
-                        "y": 15.0078,
+                        "y": 15.0044,
                         "z": 200.0
                     },
                     {
@@ -175,49 +121,63 @@
                     {
                         "t": 26.6667,
                         "x": 70.0,
-                        "y": 15.0056,
+                        "y": 15.0089,
                         "z": 200.0
                     },
                     {
                         "t": 33.3333,
                         "x": 70.0,
-                        "y": 15.0044,
+                        "y": 15.0111,
                         "z": 200.0
                     },
                     {
                         "t": 40.0,
                         "x": 70.0,
-                        "y": 15.0033,
+                        "y": 15.0133,
                         "z": 200.0
                     },
                     {
                         "t": 46.6667,
                         "x": 70.0,
-                        "y": 15.0022,
+                        "y": 15.0156,
                         "z": 200.0
                     },
                     {
                         "t": 53.3333,
                         "x": 70.0,
-                        "y": 15.0011,
+                        "y": 15.0178,
                         "z": 200.0
                     },
                     {
                         "t": 60.0,
                         "x": 70.0,
-                        "y": 15.0,
+                        "y": 15.02,
                         "z": 200.0
                     }
                 ]
+            },
+            "output": ""
+        },
+        {
+            "step_id": "UAV_1-4",
+            "subject_id": "UAV_1",
+            "step_type": "sweepFrequencyReconnaissance",
+            "step_name": "获取扫频数据",
+            "input": {
+                "target_frequency": "2-3GHz",
+                "frequency_step": "500"
+            },
+            "output": {
+                "sweepData": "sweepData"
             }
         },
         {
-            "step_id": "UAV_1-9",
+            "step_id": "UAV_1-5",
             "subject_id": "UAV_1",
-            "step_type": "external",
-            "step_name": "抬高安全返航高度",
+            "step_type": "system",
+            "step_name": "保存任务结果",
             "input": {},
-            "output": ""
+            "output": "状态保存完成: 保存任务结果"
         },
         {
             "step_id": "_processor_-1",
@@ -234,11 +194,153 @@
             }
         },
         {
-            "step_id": "UAV_1-10",
+            "step_id": "UAV_1-6",
+            "subject_id": "UAV_1",
+            "step_type": "path_planning",
+            "step_name": "规划返航航线",
+            "input": {
+                "startPositionLong": "70.0",
+                "startPositionLat": "15.02",
+                "destinationLong": "70",
+                "destinationLat": "15",
+                "map": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\LAYERDESCRIPTIONFILE.LDF",
+                "bilndArea": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\blind.txt",
+                "CoverageArea": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\clear.txt"
+            },
+            "output": {
+                "path": [
+                    {
+                        "t": 0.0,
+                        "x": 70.0,
+                        "y": 15.02,
+                        "z": 0.0
+                    },
+                    {
+                        "t": 6.66667,
+                        "x": 70.0,
+                        "y": 15.0178,
+                        "z": 111.111
+                    },
+                    {
+                        "t": 13.3333,
+                        "x": 70.0,
+                        "y": 15.0156,
+                        "z": 200.0
+                    },
+                    {
+                        "t": 20.0,
+                        "x": 70.0,
+                        "y": 15.0133,
+                        "z": 200.0
+                    },
+                    {
+                        "t": 26.6667,
+                        "x": 70.0,
+                        "y": 15.0111,
+                        "z": 200.0
+                    },
+                    {
+                        "t": 33.3333,
+                        "x": 70.0,
+                        "y": 15.0089,
+                        "z": 200.0
+                    },
+                    {
+                        "t": 40.0,
+                        "x": 70.0,
+                        "y": 15.0067,
+                        "z": 200.0
+                    },
+                    {
+                        "t": 46.6667,
+                        "x": 70.0,
+                        "y": 15.0044,
+                        "z": 200.0
+                    },
+                    {
+                        "t": 53.3333,
+                        "x": 70.0,
+                        "y": 15.0022,
+                        "z": 200.0
+                    },
+                    {
+                        "t": 60.0,
+                        "x": 70.0,
+                        "y": 15.0,
+                        "z": 200.0
+                    }
+                ]
+            }
+        },
+        {
+            "step_id": "UAV_1-7",
             "subject_id": "UAV_1",
             "step_type": "external",
-            "step_name": "沿航线返航至基地",
-            "input": {},
+            "step_name": "沿航线返航",
+            "input": {
+                "route": [
+                    {
+                        "t": 0.0,
+                        "x": 70.0,
+                        "y": 15.02,
+                        "z": 0.0
+                    },
+                    {
+                        "t": 6.66667,
+                        "x": 70.0,
+                        "y": 15.0178,
+                        "z": 111.111
+                    },
+                    {
+                        "t": 13.3333,
+                        "x": 70.0,
+                        "y": 15.0156,
+                        "z": 200.0
+                    },
+                    {
+                        "t": 20.0,
+                        "x": 70.0,
+                        "y": 15.0133,
+                        "z": 200.0
+                    },
+                    {
+                        "t": 26.6667,
+                        "x": 70.0,
+                        "y": 15.0111,
+                        "z": 200.0
+                    },
+                    {
+                        "t": 33.3333,
+                        "x": 70.0,
+                        "y": 15.0089,
+                        "z": 200.0
+                    },
+                    {
+                        "t": 40.0,
+                        "x": 70.0,
+                        "y": 15.0067,
+                        "z": 200.0
+                    },
+                    {
+                        "t": 46.6667,
+                        "x": 70.0,
+                        "y": 15.0044,
+                        "z": 200.0
+                    },
+                    {
+                        "t": 53.3333,
+                        "x": 70.0,
+                        "y": 15.0022,
+                        "z": 200.0
+                    },
+                    {
+                        "t": 60.0,
+                        "x": 70.0,
+                        "y": 15.0,
+                        "z": 200.0
+                    }
+                ]
+            },
             "output": ""
         }
     ],
@@ -268,19 +370,7 @@
             "successor": "UAV_1-7"
         },
         {
-            "predecessor": "UAV_1-7",
-            "successor": "UAV_1-8"
-        },
-        {
-            "predecessor": "UAV_1-8",
-            "successor": "UAV_1-9"
-        },
-        {
-            "predecessor": "UAV_1-9",
-            "successor": "UAV_1-10"
-        },
-        {
-            "predecessor": "UAV_1-6",
+            "predecessor": "UAV_1-4",
             "successor": "_processor_-1"
         }
     ]

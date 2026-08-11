@@ -4,6 +4,7 @@
 """
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -37,9 +38,27 @@ def _is_coord_param(param_name: str, param_desc: str, param_type: str) -> bool:
     text = f"{param_name} {param_desc}".lower()
     if param_type == "tuple":
         return True
-    if any(k in text for k in ("坐标", "位置", "经纬度", "longitude", "latitude", "coord", "x,y", "x、y")):
+    if any(k in text for k in ("坐标", "位置", "经纬度", "经度", "纬度", "longitude", "latitude", "coord", "x,y", "x、y")):
         return True
     return False
+
+
+def _pick_coord_component(value, param_name: str, param_desc: str) -> str:
+    """坐标分量拆分：参数为经度/纬度单分量（如 destinationLat），而值却是 "x,y" 坐标对时，
+    取对应分量（经度→第一个，纬度→第二个），防止 "70,15.02" 被当作单值纬度传给 exe。
+    参数不是经纬度单分量或值不含坐标对时，原样返回。"""
+    v = str(value or "").strip()
+    m = re.fullmatch(r"[\(\[]?\s*(-?\d+(?:\.\d+)?)\s*(?:[,，]\s*|\s+)(-?\d+(?:\.\d+)?)\s*[\)\]]?", v)
+    if not m:
+        return v
+    text = f"{param_name} {param_desc}".lower()
+    is_lon = any(k in text for k in ("经度", "longitude"))
+    is_lat = any(k in text for k in ("纬度", "latitude"))
+    if is_lon:
+        return m.group(1)
+    if is_lat:
+        return m.group(2)
+    return v
 
 
 def _group_to_coord_str(group) -> Optional[str]:
@@ -58,10 +77,14 @@ def _group_to_coord_str(group) -> Optional[str]:
     return None
 
 
-def _local_resolve_param(context: dict, param_name: str, param_desc: str, param_type: str) -> Optional[str]:
+def _local_resolve_param(context: dict, param_name: str, param_desc: str, param_type: str,
+                         agent_id: str = "", goal: str = "", scene_text: str = "") -> Optional[str]:
     """
     LLM 不可用/超时后的本地降级：键值直取 → 语义启发式 → 坐标按分组拼接。
-    返回候选值字符串（坐标转为 x,y 形式），找不到返回 None。
+    返回候选值字符串（坐标转为 x,y 形式，单分量坐标参数返回对应分量），找不到返回 None。
+    agent_id: 执行该动作的无人机 id（用于解析观测位置 mission_position）
+    goal: 原子动作目标文本（用于区分出航/返航语义）
+    scene_text: 子任务目标原文（含具体坐标，如"飞行至位置70,15.01..."）
     """
     if not context:
         return None
@@ -83,8 +106,23 @@ def _local_resolve_param(context: dict, param_name: str, param_desc: str, param_
         return s
 
     pname_lower = param_name.lower()
+    desc_lower = (param_desc or "").lower()
 
     is_coord = _is_coord_param(param_name, param_desc, param_type)
+
+    # 坐标分量识别：参数语义是经度还是纬度（destinationLong/起点经度 → 取经度分量）
+    comp_text = f"{pname_lower} {desc_lower}"
+    is_lon = any(k in comp_text for k in ("经度", "longitude"))
+    is_lat = any(k in comp_text for k in ("纬度", "latitude"))
+
+    def pick_component(coord: str) -> str:
+        parts = re.split(r"[,，]", coord)
+        if len(parts) == 2:
+            if is_lon:
+                return parts[0].strip()
+            if is_lat:
+                return parts[1].strip()
+        return coord
 
     # 1) 键名直取：上下文各分组里与参数名完全同名的字段
     for group in context.values():
@@ -95,38 +133,90 @@ def _local_resolve_param(context: dict, param_name: str, param_desc: str, param_
                 continue
             for k, v in item.items():
                 if str(k).lower() == pname_lower and str(v).strip():
-                    return to_coord_str(v)
+                    return pick_component(to_coord_str(v))
 
-    # 2) 坐标参数：按语义分组拼接 Longitude/Latitude（起点→uav/base 分组；终点→target/base 分组）
-    desc_lower = (param_desc or "").lower()
+    # 1.5) 别名/后缀匹配：参数名与字段名互为后缀（如 step ↔ frequency_step、
+    #      target_frequency ↔ Frequency）。值一律来自上下文原文，不编造；
+    #      仅当较短一侧长度 >=3 时启用，避免过短关键词误匹配。
+    for group in context.values():
+        if not isinstance(group, list):
+            group = [group]
+        for item in group:
+            if not isinstance(item, dict):
+                continue
+            for k, v in item.items():
+                kl = str(k).lower().strip()
+                if not kl or not str(v).strip():
+                    continue
+                if kl == pname_lower:
+                    continue
+                if (kl.endswith(pname_lower) or pname_lower.endswith(kl)) \
+                        and min(len(kl), len(pname_lower)) >= 3:
+                    return pick_component(to_coord_str(v))
+
+    # 2) 坐标参数：按语义分组拼接 Longitude/Latitude（起点→uav/base 分组；终点→目标原文/观测位置/target/base）
     is_start = any(k in pname_lower or k in desc_lower for k in ("start", "起点", "from", "当前位置", "开始", "uav", "outpoint"))
     is_end = any(k in pname_lower or k in desc_lower for k in ("dest", "终点", "目标", "target", "end", "to"))
+    goal_lower = (goal or "").lower()
+    is_return = any(k in goal_lower for k in ("返航", "返回", "回基地", "起始点", "home", "return")) or \
+                any(k in pname_lower or k in desc_lower for k in ("返航", "返回", "回基地", "起始点"))
     if is_coord:
+        # 子任务目标原文中的坐标：取最后一个坐标对（任务 goal 通常以"飞至位置X,Y"结尾）
+        goal_coord = None
+        if scene_text:
+            m = re.findall(r"(\d+(?:\.\d+)?)\s*[,，]\s*(\d+(?:\.\d+)?)", scene_text)
+            if m:
+                goal_coord = f"{m[-1][0]},{m[-1][1]}"
+        # 执行无人机的观测位置（mission_position）
+        mp_coord = None
+        if agent_id:
+            for g in (context.get("uavs"), context.get("uav")):
+                if not isinstance(g, list):
+                    g = [g]
+                for u in g:
+                    if isinstance(u, dict) and u.get("id") == agent_id:
+                        mp = str(u.get("mission_position") or "").strip()
+                        parts = re.split(r"[,，]", mp)
+                        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+                            mp_coord = f"{parts[0].strip()},{parts[1].strip()}"
+                        break
+
         if is_end:
-            end_candidates = []
-            target_g = context.get("targets")
-            base_g = context.get("base")
-            for g in (target_g, base_g):
+            if not is_return:
+                for c in (goal_coord, mp_coord):
+                    if c:
+                        return pick_component(c)
+            # 返航优先回基地；出航兜底 target → base
+            groups = (context.get("base"), context.get("targets")) if is_return \
+                else (context.get("targets"), context.get("base"))
+            for g in groups:
                 if g:
                     c = _group_to_coord_str(g)
                     if c:
-                        end_candidates.append(c)
-            # 终点优先 target；无法区分时返回第一个候选，否则返回 None 交给更上层
-            if end_candidates:
-                return end_candidates[0]
-        # 起点：UAV 分组优先，其次 base
+                        return pick_component(c)
+            return None
+        # 起点：执行无人机的当前坐标优先，其次任意 UAV / base
+        if agent_id:
+            for g in (context.get("uavs"), context.get("uav")):
+                if not isinstance(g, list):
+                    g = [g]
+                for u in g:
+                    if isinstance(u, dict) and u.get("id") == agent_id:
+                        c = _group_to_coord_str([u])
+                        if c:
+                            return pick_component(c)
         for gname in ("uavs", "uav", "base"):
             g = context.get(gname)
             if g:
                 c = _group_to_coord_str(g)
                 if c:
-                    return c
+                    return pick_component(c)
         # 兜底：任一分组含 kind = "start" 类坐标
         for gname, g in context.items():
             if any(k in str(gname).lower() for k in ("start", "uav", "pos", "航")):
                 c = _group_to_coord_str(g)
                 if c:
-                    return c
+                    return pick_component(c)
 
     # 3) 语义启发式：按参数含义匹配单个键
     aliases = {
@@ -325,66 +415,6 @@ async def _llm_select_file(llm, files: list[dict], scene_description: str,
         return None
 
 
-async def _llm_extract_value_from_file(llm, file_path: str, file_ext: str,
-                                       scene_description: str, param_name: str,
-                                       param_desc: str) -> Optional[str]:
-    """
-    读取文件内容，用 LLM 提取指定参数的值
-    适用于 tuple/string/number 等非 file 类型参数
-    Returns: 提取到的值字符串，或 None
-    """
-    if not llm:
-        return None
-
-    try:
-        content = Path(file_path).read_text(encoding="utf-8")
-    except Exception:
-        try:
-            content = Path(file_path).read_text(encoding="gbk")
-        except Exception as e:
-            sys.stderr.write(f"[ToolExecutor] 读取文件失败 {file_path}: {e}\n")
-            sys.stderr.flush()
-            return None
-
-    # 截断过长内容
-    if len(content) > 3000:
-        content = content[:3000] + "\n...(已截断)"
-
-    prompt = f"""你是一个数据提取助手。根据场景和参数需求，从文件内容中提取对应值。
-
-场景描述：{scene_description}
-
-需要提取的参数：{param_name}
-参数描述：{param_desc}
-参数类型：非文件类型（如坐标、数值、字符串等）
-
-文件内容：
-{content}
-
-请从文件内容中提取该参数的值。如果是坐标，输出格式如 x y；如果是数值，只输出数字；如果是字符串，输出原始字符串。
-如果文件中找不到相关信息，输出 "NONE"。"""
-
-    try:
-        from langchain_core.messages import HumanMessage
-        response = await _ainvoke_with_timeout(llm, prompt)
-        value = response.strip()
-
-        if value == "NONE" or not value:
-            return None
-
-        # 去除可能的引号包裹
-        value = value.strip('"').strip("'")
-        return value
-    except asyncio.TimeoutError:
-        sys.stderr.write(f"[ToolExecutor] LLM文件取值超时({LLM_CALL_TIMEOUT}s): {param_name}\n")
-        sys.stderr.flush()
-        return None
-    except Exception as e:
-        sys.stderr.write(f"[ToolExecutor] LLM提取值失败: {e}\n")
-        sys.stderr.flush()
-        return None
-
-
 def _resolve_context_path(context: dict, path: str) -> Optional[str]:
     """按点号路径从上下文对象中取真实值；数组支持数字索引或 id 定位。
 
@@ -440,9 +470,16 @@ async def _llm_extract_from_context(llm, param_name: str, param_desc: str,
     sys.stderr.flush()
     
     goal_hint = f"\n动作目标：{goal}\n根据动作目标理解该参数的含义。" if goal else ""
+    return_hint = ""
+    if goal and any(k in goal for k in ("返航", "返回", "回基地", "起始点")):
+        return_hint = (
+            "\n注意：该动作是【返航】，终点坐标必须取 base（基地）的 Longitude/Latitude，"
+            "禁止取 uavs.*.path.to_lon/to_lat（那是上次出航的终点/目标点坐标）。"
+        )
     
     prompt = f"""在结构化上下文中找到与指定参数语义最匹配的字段。
 {goal_hint}
+{return_hint}
 结构化上下文：
 {context_text}
 
@@ -582,7 +619,8 @@ def _extract_output_fields(output: str) -> list:
 def _write_path_to_redis(redis_mgr, session_id: str, state: dict, tool_inputs: dict, output: str):
     """路径规划成功后，将航迹点写入 Redis 上下文（关联到对应的无人机）。
 
-    记录该航迹由哪架无人机、从哪个起点到哪个终点。
+    按实体存储：目的地坐标不重复写进无人机航迹（那是 target/base 的职责），
+    航迹只记录 agent 与 waypoints，避免"上次出航终点"残留干扰后续返航解析。
     """
     if not redis_mgr:
         return
@@ -594,7 +632,7 @@ def _write_path_to_redis(redis_mgr, session_id: str, state: dict, tool_inputs: d
         return
     try:
         agent_id = (state or {}).get("_agent_id") or "UAV_1"
-        # 起点/终点：优先取经规范化的 tool_inputs 坐标，其次尝试逗号拆分的组合字段
+        # 起点/终点仅用于日志与 UAV 当前坐标更新，不写入航迹记录
         start_lon = str((tool_inputs.get("startPositionLong") or "")).strip()
         start_lat = str((tool_inputs.get("startPositionLat") or "")).strip()
         end_lon = str((tool_inputs.get("destinationLong") or "")).strip()
@@ -607,10 +645,6 @@ def _write_path_to_redis(redis_mgr, session_id: str, state: dict, tool_inputs: d
 
         route = {
             "agent": agent_id,
-            "from_lon": start_lon,
-            "from_lat": start_lat,
-            "to_lon": end_lon,
-            "to_lat": end_lat,
             "waypoints": waypoints,
         }
         # 直接构建完整最新上下文并整体保存，避免 update_context 按 id 深合并时丢弃新增 uav
@@ -685,6 +719,9 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
     
     # 获取场景描述
     scene_description = state.get("original_scenario", "")
+    
+    # 执行该动作的无人机 id（用于解析观测位置 mission_position）
+    agent_id = str((state or {}).get("_agent_id") or "").strip()
     
     # 获取 session_id
     session_id = state.get("session_id", "default")
@@ -763,28 +800,53 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
             sys.stderr.write(f"[ToolExecutor] 结构化上下文: {'有' if context else '空'}\n")
             sys.stderr.flush()
             if context and llm:
+                # 真实 exe（当前只有 path_planning）的坐标参数语义固定：出航终点=目标点，
+                # 返航终点=基地。_local_resolve_param 含返航优先 base 的逻辑，可确定性区分；
+                # 而 LLM 容易被 uavs.*.path.to_lon/to_lat（上次出航终点）干扰，返航时会把
+                # 旧目标点当终点。因此真实 exe 先走本地语义解析，LLM 仅作兜底。
+                local_tried = False
+                if real_exec:
+                    local_value = _local_resolve_param(context, param_name, param_desc, param_type,
+                                                       agent_id=agent_id, goal=goal, scene_text=scene_description)
+                    local_tried = True
+                    if local_value:
+                        sys.stderr.write(f"[ToolExecutor] path_planning 本地语义解析: {param_name}={local_value}\n")
+                        sys.stderr.flush()
+                        tool_inputs[param_name] = local_value
+                        continue
                 extracted_value = await _llm_extract_from_context(
                     llm, param_name, param_desc, param_type, context, goal
                 )
                 if extracted_value:
+                    extracted_value = _pick_coord_component(extracted_value, param_name, param_desc)
                     sys.stderr.write(f"[ToolExecutor] LLM提取: {param_name}={extracted_value}\n")
                     sys.stderr.flush()
                     tool_inputs[param_name] = extracted_value
                     continue
                 elif not real_exec:
-                    # 不执行 exe 的算法：LLM 未查到值属于正常现象，不需本地降级，
-                    # 直接留空，交给末尾"非 exe 缺参用参数名占位"处理（写脚本时显示参数名）。
-                    sys.stderr.write(f"[ToolExecutor] LLM提取失败(非exe)，{param_name} 保持为空，交由参数名占位\n")
-                    sys.stderr.flush()
-                else:
-                    # 真实 exe 算法（如 path_planning）：LLM 超时/失败/返回 NONE
-                    # → 本地降级（键值直取 + 语义启发式），仍缺才进入 missing_params
-                    local_value = _local_resolve_param(context, param_name, param_desc, param_type)
+                    # 不执行 exe 的算法：LLM 未查到值 → 本地键值/别名直取（值必须来自上下文原文，
+                    # 与 target_frequency 命中 targets.T1.Frequency 同理），仍找不到才留空，
+                    # 交给末尾"非 exe 缺参用参数名占位"处理（写脚本时显示参数名）。
+                    local_value = _local_resolve_param(context, param_name, param_desc, param_type,
+                                                       agent_id=agent_id, goal=goal, scene_text=scene_description)
                     if local_value:
-                        sys.stderr.write(f"[ToolExecutor] LLM提取失败，本地降级补齐: {param_name}={local_value}\n")
+                        sys.stderr.write(f"[ToolExecutor] LLM提取失败(非exe)，本地键值补齐: {param_name}={local_value}\n")
                         sys.stderr.flush()
                         tool_inputs[param_name] = local_value
                         continue
+                    sys.stderr.write(f"[ToolExecutor] LLM提取失败(非exe)，{param_name} 保持为空，交由参数名占位\n")
+                    sys.stderr.flush()
+                else:
+                    # 真实 exe（path_planning 已在上方优先尝试本地解析，失败才走到这里）：
+                    # LLM 超时/失败/返回 NONE → 本地降级，仍缺才进入 missing_params
+                    if not local_tried:
+                        local_value = _local_resolve_param(context, param_name, param_desc, param_type,
+                                                           agent_id=agent_id, goal=goal, scene_text=scene_description)
+                        if local_value:
+                            sys.stderr.write(f"[ToolExecutor] LLM提取失败，本地降级补齐: {param_name}={local_value}\n")
+                            sys.stderr.flush()
+                            tool_inputs[param_name] = local_value
+                            continue
                     sys.stderr.write(f"[ToolExecutor] LLM提取失败且本地无法补齐: {param_name}\n")
                     sys.stderr.flush()
             elif not context:

@@ -252,7 +252,7 @@ class Retriever:
                 continue
             out.append({
                 "text": doc,
-                "metadata": results["metadatas"][0][i],
+                "metadata": results["metadatas"][0][i] or {},
                 "distance": dist,
             })
         return out

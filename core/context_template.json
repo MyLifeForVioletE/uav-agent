@@ -1,6 +1,6 @@
 {
     "uavs": [
-        {"id": "", "Longitude": "","Latitude":""}
+        {"id": "", "Longitude": "", "Latitude": "", "mission_position": ""}
     ],
     "targets": [
         {"id": "", "Longitude": "","Latitude":"","Frequency":"","frequency_step":""}

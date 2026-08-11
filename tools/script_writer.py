@@ -33,12 +33,16 @@ dependencies 处理规则（每次 _save 自动重算，文件任何时刻完整
   每次重算时保留并合并进 dependencies；仅接受跨步骤的真实映射（过滤自环）
 - 条目按 successor 分组：单一依赖时 predecessor 为字符串，多个依赖时为字符串列表
 """
+import asyncio
 import json
 import re
 import sys
 from pathlib import Path
 
 from core.config import BASE_DIR
+
+# LLM 单次调用总超时（秒）：与 fleet/tool_executor 保持一致，防止流式响应慢导致永久挂起
+SCRIPT_WRITER_LLM_TIMEOUT = 60.0
 
 
 def _load_tool_schemas() -> dict:
@@ -81,6 +85,34 @@ def _get_output_schema(tool_name: str) -> dict:
 # 可去除 t 前缀的目标字段基名（tFreq→freq, tBand→band, tStre→stre, tlat→lat, tlon→lon）
 _TARGET_PREFIX_BASES = {"freq", "band", "stre", "lat", "lon"}
 
+# 飞行/返航 external 动作关键词：命中则回填/解析航线引用（起飞/降落等不沿航线的动作除外）
+_FLIGHT_KEYWORDS = ("飞行", "飞往", "飞向", "飞至", "飞抵", "飞回", "返航", "返回", "巡航", "航线")
+
+
+def is_flight_action(action_name: str) -> bool:
+    """判断动作是否为沿航线飞行的飞行/返航动作（起飞/降落不含关键词，返回 False）"""
+    return any(k in (action_name or "") for k in _FLIGHT_KEYWORDS)
+
+
+def recent_path_ref(steps: list, subject_id: str) -> str:
+    """同 subject 最近一次 path_planning 步骤的 step:// 引用；无则返回空串"""
+    ref = ""
+    for s in steps:
+        if s.get("subject_id") == subject_id and s.get("step_type") == "path_planning":
+            ref = f"step://{s.get('step_id')}.output.path"
+    return ref
+
+
+def _recent_path_waypoints(steps: list, subject_id: str) -> list:
+    """同 subject 最近一次 path_planning 步骤 output.path 的航迹点列表；无则返回空列表"""
+    for s in reversed(steps):
+        if s.get("subject_id") == subject_id and s.get("step_type") == "path_planning":
+            out = s.get("output")
+            if isinstance(out, dict) and isinstance(out.get("path"), list):
+                return list(out["path"])
+            return []
+    return []
+
 
 def _norm_field(name) -> str:
     """字段名归一化，供血缘匹配：
@@ -106,13 +138,16 @@ def _tool_produced_fields(step: dict) -> set:
 
 
 def _tool_consumed_fields(step: dict) -> set:
-    """step 消费的字段（归一化）：优先工具 input_schema；无 schema（external/system）回退到实际 input 键"""
+    """step 消费的字段（归一化）：优先工具 input_schema；无 schema（external/system）回退到实际 input 键。
+    step:// 数据引用（如 input.route）不算消费字段，由 _edge_predecessors 单独建边。
+    """
     schema = _get_input_schema(step.get("step_type", ""))
     if schema:
         return {_norm_field(k) for k in schema.keys()}
     inputs = step.get("input")
     if isinstance(inputs, dict):
-        return {_norm_field(k) for k in inputs.keys()}
+        return {_norm_field(k) for k, v in inputs.items()
+                if not (isinstance(v, str) and v.startswith("step://"))}
     return set()
 
 
@@ -155,6 +190,20 @@ def _edge_predecessors(steps: list, llm_field_map: dict = None) -> dict:
                 add(step_id, steps[j].get("step_id", ""))
         for f in _tool_produced_fields(step):
             produced_at[f] = i
+
+    # 数据引用边：input 中 step://<id>.output.path 引用 → 显式数据依赖（如飞行动作依赖航线产出）
+    for step in steps:
+        if step.get("step_type") == "__pause__":
+            continue
+        inputs = step.get("input")
+        if not isinstance(inputs, dict):
+            continue
+        step_id = step.get("step_id", "")
+        for v in inputs.values():
+            if isinstance(v, str) and v.startswith("step://"):
+                m = re.match(r"step://([^.]+)", v)
+                if m:
+                    add(step_id, m.group(1))
 
     # LLM 兜底边（持久化映射；自环已在 add 中过滤）
     for field_key, from_id in (llm_field_map or {}).items():
@@ -286,12 +335,20 @@ def write_action_step(session_id: str, subject_id: str, action: dict,
 
     inputs = {k: v for k, v in (tool_inputs or {}).items() if str(v).strip()}
 
+    steps = load_steps(session_id)
+
+    # 飞行/返航 external 动作：内联最近一次同 subject 的 path_planning 输出航迹点。
+    # 写入时刻该 path_planning 步骤必然已落盘，出航/返航自动关联各自航段；
+    # 无可用航迹点时标注"等待航线"。
+    if executor == "external" and is_flight_action(action_name):
+        waypoints = _recent_path_waypoints(steps, subject_id)
+        inputs["route"] = waypoints if waypoints else "等待航线"
+
     if output_fields:
         step_output = {f: f for f in output_fields}
     else:
         step_output = _parse_output(tool_name, output)
 
-    steps = load_steps(session_id)
     seq = sum(1 for s in steps if s.get("subject_id") == subject_id) + 1
     step = {
         "step_id": f"{subject_id}-{seq}",
@@ -420,8 +477,11 @@ async def refresh_dependencies_with_llm(session_id: str, llm) -> bool:
 
     try:
         from langchain_core.messages import HumanMessage
-        response = await llm.ainvoke([HumanMessage(content=prompt)])
-        raw = str(response.content).strip()
+        raw = await asyncio.wait_for(
+            llm.ainvoke([HumanMessage(content=prompt)]),
+            timeout=SCRIPT_WRITER_LLM_TIMEOUT,
+        )
+        raw = str(raw.content).strip()
     except Exception as e:
         sys.stderr.write(f"[ScriptWriter] LLM 依赖推断调用失败: {e}\n")
         sys.stderr.flush()

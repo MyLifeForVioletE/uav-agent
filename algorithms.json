@@ -410,7 +410,7 @@
           "format":"range",
           "description":"目标频率范围（如 1~2GHz）"
         },
-        "step":{
+        "frequency_step":{
           "type":"number",
           "description":"目标步进"
         }

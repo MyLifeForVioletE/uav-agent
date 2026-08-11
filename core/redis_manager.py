@@ -202,7 +202,7 @@ class RedisManager:
             sys.stderr.write(f"[Redis] init_context 失败: {e}\n")
             sys.stderr.flush()
             return False
-    
+
     def _deep_merge(self, base, override):
         """递归深合并，支持 dict+dict、list+dict(按索引或ID)、list+list"""
         if isinstance(base, dict) and isinstance(override, dict):

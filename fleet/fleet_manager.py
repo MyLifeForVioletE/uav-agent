@@ -53,6 +53,20 @@ def _is_stub_placeholder_output(output: str) -> bool:
     return bool(re.fullmatch(r"输出;[\s,，、]*(?:[A-Za-z_][A-Za-z0-9_]*[\s,，、]*)*", str(output).strip()))
 
 
+# LLM 单次调用总超时（秒）：与 tool_executor 保持一致，防止流式响应慢导致永久挂起
+FLEET_LLM_TIMEOUT = 60.0
+
+
+async def _ainvoke_with_timeout(llm, prompt: str, timeout: float = FLEET_LLM_TIMEOUT):
+    """带总超时的 LLM 调用：超时抛 TimeoutError，由调用方降级处理。"""
+    from langchain_core.messages import HumanMessage
+    response = await asyncio.wait_for(
+        llm.ainvoke([HumanMessage(content=prompt)]),
+        timeout=timeout,
+    )
+    return response.content.strip()
+
+
 class FleetManager:
     """Fleet 管理器：协调多个子agent的生命周期"""
     
@@ -339,9 +353,7 @@ class FleetManager:
             '"action_name": "人类可读动作名", "goal": "该动作要算出什么参数", "reason": "简短理由"}'
         )
         try:
-            from langchain_core.messages import HumanMessage
-            response = await llm.ainvoke([HumanMessage(content=prompt)])
-            raw = str(response.content).strip()
+            raw = await _ainvoke_with_timeout(llm, prompt)
         except Exception as e:
             sys.stderr.write(f"[Fleet] 缺参推导调用失败: {e}\n")
             sys.stderr.flush()
@@ -401,9 +413,17 @@ class FleetManager:
                                                 tool_name: str, goal: str, output: str,
                                                 task_id: str = "", task_name: str = ""):
         """指挥侧：LLM 从算法/分析输出中提取关键字段并写入 Redis 上下文（原 UAV 直写逻辑搬移）"""
+        # path_planning 特判：航迹已由 tool_executor 结构化写入 uavs[].path，此处只需把
+        # 执行 agent 的位置确定性更新为航迹终点。不调用 LLM——避免 LLM 把终点坐标错误写入
+        # targets（污染目标位置，导致后续规划读到错的 destinationLat），也避免慢 LLM 阻塞 tick。
+        if tool_name == "path_planning":
+            self._update_uav_position_from_path(session_id, agent_id, output)
+            return
+
         llm = self.deps.llm_no_tools if self.deps else None
         if not llm:
             return
+
         current_context = self.redis_mgr.get_context(session_id) or {}
 
         # 工具输出定义，帮助 LLM 理解返回字段含义
@@ -468,10 +488,8 @@ class FleetManager:
         ]
         prompt = "".join(prompt_parts)
 
-        from langchain_core.messages import HumanMessage
         try:
-            response = await llm.ainvoke([HumanMessage(content=prompt)])
-            content = str(response.content).strip()
+            content = await _ainvoke_with_timeout(llm, prompt)
         except Exception as e:
             sys.stderr.write(f"[Fleet] 指挥结果提取调用失败: {e}\n")
             sys.stderr.flush()
@@ -504,6 +522,44 @@ class FleetManager:
         sys.stderr.write(f"[Fleet] 指挥更新上下文: {json.dumps(nested, ensure_ascii=False)}\n")
         sys.stderr.flush()
 
+    def _update_uav_position_from_path(self, session_id: str, agent_id: str, output: str):
+        """path_planning 结果的确定性更新：把执行 agent 的位置改为航迹终点。
+
+        不写 targets/base（避免污染目标坐标），航迹本体由 tool_executor 写入 uavs[].path。
+        """
+        if not self.redis_mgr:
+            return
+        try:
+            from agent.executors.tool_executor import _parse_waypoints
+        except Exception as e:
+            sys.stderr.write(f"[Fleet] 导入 _parse_waypoints 失败: {e}\n")
+            sys.stderr.flush()
+            return
+        waypoints = _parse_waypoints(str(output or ""))
+        if not waypoints:
+            sys.stderr.write("[Fleet] path_planning 输出无航迹点，跳过 UAV 位置更新\n")
+            sys.stderr.flush()
+            return
+        end = waypoints[-1]
+        ctx = self.redis_mgr.get_context(session_id) or {}
+        uavs = ctx.get("uavs")
+        if not isinstance(uavs, list):
+            uavs = []
+            ctx["uavs"] = uavs
+        for u in uavs:
+            if isinstance(u, dict) and u.get("id") == agent_id:
+                u["Longitude"] = end["Longitude"]
+                u["Latitude"] = end["Latitude"]
+                break
+        else:
+            uavs.append({"id": agent_id, "Longitude": end["Longitude"], "Latitude": end["Latitude"]})
+        self.redis_mgr.save_context(session_id, ctx)
+        sys.stderr.write(
+            f"[Fleet] path_planning 结果更新位置: {agent_id} -> "
+            f"[{end['Longitude']},{end['Latitude']}]（未写入 targets）\n"
+        )
+        sys.stderr.flush()
+
     async def _handle_generic_request(self, state: AgentState, msg: dict):
         """子 agent 请示：交指挥 LLM 决策，生成 reply（可附带向其它 agent 下发的指令）"""
         llm = self.deps.llm_no_tools if self.deps else None
@@ -532,9 +588,7 @@ class FleetManager:
             "如果无需向其它 agent 下发指令，instructions 为空数组。"
         )
         try:
-            from langchain_core.messages import HumanMessage
-            response = await llm.ainvoke([HumanMessage(content=prompt)])
-            raw = str(response.content).strip()
+            raw = await _ainvoke_with_timeout(llm, prompt)
         except Exception as e:
             sys.stderr.write(f"[Fleet] 指挥决策调用失败: {e}\n")
             sys.stderr.flush()
@@ -612,9 +666,7 @@ class FleetManager:
                 "若全部无法提取，输出 {}。"
             )
             try:
-                from langchain_core.messages import HumanMessage
-                response = await llm.ainvoke([HumanMessage(content=prompt)])
-                raw = str(response.content).strip()
+                raw = await _ainvoke_with_timeout(llm, prompt)
                 import re as _re
                 m = _re.search(r"\{.*\}", raw, _re.DOTALL)
                 if m:
@@ -702,9 +754,7 @@ class FleetManager:
         prompt = "".join(prompt_parts)
 
         try:
-            from langchain_core.messages import HumanMessage
-            response = await llm.ainvoke([HumanMessage(content=prompt)])
-            content = str(response.content).strip()
+            content = await _ainvoke_with_timeout(llm, prompt)
         except Exception as e:
             sys.stderr.write(f"[Fleet] 用户参数映射调用失败: {e}\n")
             sys.stderr.flush()
