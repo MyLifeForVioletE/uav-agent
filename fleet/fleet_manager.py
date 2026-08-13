@@ -4,6 +4,7 @@ Fleet 生命周期管理器：
 """
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Dict
@@ -78,11 +79,8 @@ class FleetManager:
         self.redis_mgr = redis_mgr
         self.sub_agents: Dict[str, SubAgent] = {}   # uav_id → SubAgent
         self.task_to_agent: Dict[str, str] = {}       # task_id → agent_id
-        self._running_tasks: set = set()              # 正在执行的 task_id 集合
         self._completed_tasks: set = set()            # 已完成的 task_id 集合（执行完成）
-        self._planned_tasks: set = set()              # 已规划但未执行的任务
-        self._saved_plans: dict = {}                  # task_id → {detail_actions}
-        self._phase: str = "planning"                 # "planning" | "execution"
+        self._dispatched_tasks: set = set()           # 已通过 Kafka 派发的 task_id 集合（每个任务只派发一次）
         self._processor_agent: SubAgent | None = None  # 信息处理类子任务的 agent
         self._bus = get_kafka_bus()
     
@@ -234,8 +232,11 @@ class FleetManager:
         write_action_step(session_id, from_id, action, action.get("tool_inputs", {}), output, output_fields)
 
     async def _handle_coordinator_request(self, state: AgentState, msg: dict):
-        """子 agent 请示：缺参请求走专项处理；其余交指挥 LLM 决策"""
+        """子 agent 请示：规划确认/缺参请求走专项处理；其余交指挥 LLM 决策"""
         payload = msg.get("payload") or {}
+        if payload.get("request_type") == "plan_confirm":
+            await self._handle_plan_confirm_request(state, msg)
+            return
         if payload.get("request_type") == "missing_param":
             await self._handle_missing_param_request(state, msg)
             return
@@ -373,14 +374,17 @@ class FleetManager:
             return {"derivable": False}
 
     async def _handle_agent_result(self, state: AgentState, msg: dict):
-        """子 agent 算法/分析结果：指挥 LLM 从原始输出提取字段，更新 Redis 上下文 + 归档 shared_results"""
+        """子 agent 算法/分析结果：仅归档 shared_results。
+
+        上下文更新不再经指挥 LLM 提取：stub 算法的空占位由
+        tool_executor._write_output_placeholders 建立，真实 exe（path_planning）的航迹与
+        位置由 tool_executor._write_path_to_redis 确定性写入，各执行 agent 自行落库。
+        避免指挥 LLM 把算法输出中的字段名/占位文本当成值写进上下文造成污染。
+        """
         payload = msg.get("payload") or {}
         output = payload.get("algorithm_output", "") or msg.get("content", "")
         if not output:
             return
-        tool_name = payload.get("tool_name", "")
-        goal = payload.get("goal", "")
-        source = payload.get("source", "uav")
         from_id = msg.get("from", "")
 
         # 归档 shared_results
@@ -390,175 +394,6 @@ class FleetManager:
             "output": str(output)[:500],
             "source": from_id,
         }
-
-        # 非 exe 算法 stub 占位输出（"输出;字段名列表"）不含真实数据，
-        # 跳过指挥 LLM 提取，避免把字段名写成值污染空占位。
-        if _is_stub_placeholder_output(output):
-            sys.stderr.write(f"[Fleet] {tool_name or from_id} stub 占位输出，跳过上下文提取: {str(output)[:80]}\n")
-            sys.stderr.flush()
-            return
-
-        # 指挥 LLM 提取 → 写 Redis
-        if self.redis_mgr:
-            try:
-                await self._update_context_from_agent_result(
-                    state.get("session_id", "default"), from_id, tool_name, goal, output,
-                    task_id=payload.get("task_id", ""), task_name=payload.get("task_name", ""),
-                )
-            except Exception as e:
-                sys.stderr.write(f"[Fleet] 结果上下文更新失败: {e}\n")
-                sys.stderr.flush()
-
-    async def _update_context_from_agent_result(self, session_id: str, agent_id: str,
-                                                tool_name: str, goal: str, output: str,
-                                                task_id: str = "", task_name: str = ""):
-        """指挥侧：LLM 从算法/分析输出中提取关键字段并写入 Redis 上下文（原 UAV 直写逻辑搬移）"""
-        # path_planning 特判：航迹已由 tool_executor 结构化写入 uavs[].path，此处只需把
-        # 执行 agent 的位置确定性更新为航迹终点。不调用 LLM——避免 LLM 把终点坐标错误写入
-        # targets（污染目标位置，导致后续规划读到错的 destinationLat），也避免慢 LLM 阻塞 tick。
-        if tool_name == "path_planning":
-            self._update_uav_position_from_path(session_id, agent_id, output)
-            return
-
-        llm = self.deps.llm_no_tools if self.deps else None
-        if not llm:
-            return
-
-        current_context = self.redis_mgr.get_context(session_id) or {}
-
-        # 工具输出定义，帮助 LLM 理解返回字段含义
-        tool_params = ""
-        algo = {}
-        try:
-            with open(BASE_DIR / "algorithms.json", encoding="utf-8") as f:
-                algos = {a["name"]: a for a in json.load(f).get("capabilities", [])}
-            algo = algos.get(tool_name, {})
-            schema = algo.get("output_schema", {})
-            if schema:
-                lines = ["【工具输出定义】"]
-                for pname, pinfo in schema.items():
-                    lines.append(f"- {pname}: {pinfo.get('description', pname)}")
-                tool_params = "\n".join(lines) + "\n\n"
-        except Exception:
-            pass
-
-        # 若算法把结果写入输出文件（如 pathPlanning 的 "Output file: path_xxx.txt"），读取其内容一并交给 LLM
-        import re as _re
-        output_enriched = str(output)[:3000]
-        try:
-            exe_path = algo.get("executable", "")
-            work_dir = algo.get("working_dir", "") or (str(Path(exe_path).parent) if exe_path else "")
-            m = _re.search(r"Output file:\s*([^\s\r\n]+)", output_enriched)
-            if m and work_dir:
-                out_file = Path(work_dir) / m.group(1)
-                if out_file.is_file():
-                    file_content = out_file.read_text(encoding="utf-8", errors="replace")
-                    output_enriched += f"\n\n【输出文件 {m.group(1)} 内容】\n{file_content[:3000]}"
-        except Exception:
-            pass
-
-        prompt_parts = [
-            "你是一个任务执行系统的上下文更新模块。\n",
-            "算法工具执行完成后，从工具返回的结果中提取关键数据，更新 Redis 上下文，"
-            "以便后续子任务（如数据分析）可以直接使用。\n\n",
-            f"【当前 agent】{agent_id}\n\n",
-            f"【所属任务】{task_id} - {task_name}\n\n",
-            f"【动作目标】{goal}\n\n",
-            f"【调用的算法】{tool_name}\n\n",
-            f"【算法返回结果】\n{output_enriched}\n\n",
-            tool_params,
-            f"【当前 Redis 上下文】{json.dumps(current_context, ensure_ascii=False)}\n\n",
-            "【上下文字段规范（必须遵守）】\n"
-            "1. 模板中 uavs/targets/base 的位置字段只有 Longitude 和 Latitude，不存在 position/x/y 字段。\n"
-            "2. 更新位置时必须写入 Longitude 和 Latitude 两个字段，例如 uavs.0.Longitude、uavs.0.Latitude。\n"
-            "3. 坐标值若是 \"70,15.01\" 这类用逗号分隔的字符串，必须拆成两条分别写入 Longitude（70）和 Latitude（15.01）。\n"
-            "4. 其余数据（如路径 path、扫频数据 sweep_data、分析结论 analysis_result）可按语义新增字段，但不得新增位置类字段。\n\n"
-            "【结果归属判断（必须遵守）】\n"
-            "1. 本结果来自任务 {task_id}（{task_name}），必须把数据写入该任务对应的 target 条目。\n"
-            "2. 若 task_id 与当前上下文中某个 target 的 id 一致（如 task_id=T1、target.id=T1），优先写入该 target。\n"
-            "3. 若 task_id 匹配不上，根据 goal 与结果内容判断应归属的 target；确实无法确定时写入 targets 的第一个元素。\n\n"
-            "分析思路：\n"
-            "1. 从算法返回结果中提取有意义的数据（如扫频数据、目标参数、位置、路径等）\n"
-            "2. 决定这些数据应该存储到上下文的哪个字段（如 targets.T1.sweep_data、uavs.0.Longitude/Latitude、uavs.0.path）\n"
-            "3. 如果结果中没有可提取的数据，返回空对象 {}\n\n"
-            "请输出一个 JSON 对象表示要更新到 Redis 的字段映射。\n",
-            'key 为点号分隔的路径（如 "targets.T1.sweep_data" 或 "uavs.UAV_1.Latitude"），\n',
-            "数组既可用数字索引也可用 id 值来定位元素。\n",
-            "value 为具体的数值或字符串。",
-        ]
-        prompt = "".join(prompt_parts)
-
-        try:
-            content = await _ainvoke_with_timeout(llm, prompt)
-        except Exception as e:
-            sys.stderr.write(f"[Fleet] 指挥结果提取调用失败: {e}\n")
-            sys.stderr.flush()
-            return
-
-        try:
-            updates = json.loads(content)
-        except json.JSONDecodeError:
-            m = _re.search(r'\{.*\}', content, _re.DOTALL)
-            updates = json.loads(m.group()) if m else None
-
-        if not updates or not isinstance(updates, dict):
-            return
-
-        nested = {}
-        for key_path, val in updates.items():
-            parts = key_path.split(".")
-            # 过滤 path：航线已由 tool_executor（_write_path_to_redis）结构化写入 uavs[].path，
-            # 不允许 LLM 重复写入（会污染 targets.T1.path，或用扁平数组覆盖结构）。
-            if "path" in {p.strip() for p in parts}:
-                sys.stderr.write(f"[Fleet] 忽略 LLM 写入的 path 字段: {key_path}（由 tool_executor 负责）\n")
-                sys.stderr.flush()
-                continue
-            d = nested
-            for p in parts[:-1]:
-                d = d.setdefault(p, {})
-            d[parts[-1]] = val
-
-        self.redis_mgr.update_context(session_id, nested)
-        sys.stderr.write(f"[Fleet] 指挥更新上下文: {json.dumps(nested, ensure_ascii=False)}\n")
-        sys.stderr.flush()
-
-    def _update_uav_position_from_path(self, session_id: str, agent_id: str, output: str):
-        """path_planning 结果的确定性更新：把执行 agent 的位置改为航迹终点。
-
-        不写 targets/base（避免污染目标坐标），航迹本体由 tool_executor 写入 uavs[].path。
-        """
-        if not self.redis_mgr:
-            return
-        try:
-            from agent.executors.tool_executor import _parse_waypoints
-        except Exception as e:
-            sys.stderr.write(f"[Fleet] 导入 _parse_waypoints 失败: {e}\n")
-            sys.stderr.flush()
-            return
-        waypoints = _parse_waypoints(str(output or ""))
-        if not waypoints:
-            sys.stderr.write("[Fleet] path_planning 输出无航迹点，跳过 UAV 位置更新\n")
-            sys.stderr.flush()
-            return
-        end = waypoints[-1]
-        ctx = self.redis_mgr.get_context(session_id) or {}
-        uavs = ctx.get("uavs")
-        if not isinstance(uavs, list):
-            uavs = []
-            ctx["uavs"] = uavs
-        for u in uavs:
-            if isinstance(u, dict) and u.get("id") == agent_id:
-                u["Longitude"] = end["Longitude"]
-                u["Latitude"] = end["Latitude"]
-                break
-        else:
-            uavs.append({"id": agent_id, "Longitude": end["Longitude"], "Latitude": end["Latitude"]})
-        self.redis_mgr.save_context(session_id, ctx)
-        sys.stderr.write(
-            f"[Fleet] path_planning 结果更新位置: {agent_id} -> "
-            f"[{end['Longitude']},{end['Latitude']}]（未写入 targets）\n"
-        )
-        sys.stderr.flush()
 
     async def _handle_generic_request(self, state: AgentState, msg: dict):
         """子 agent 请示：交指挥 LLM 决策，生成 reply（可附带向其它 agent 下发的指令）"""
@@ -640,6 +475,118 @@ class FleetManager:
         sys.stderr.write(f"[Fleet] 指挥回复 {to_agent_id}: {content[:120]}\n")
         sys.stderr.flush()
 
+    async def _handle_plan_confirm_request(self, state: AgentState, msg: dict):
+        """规划确认请示：子 agent 的宏观/详细规划已产出，转达用户确认。
+
+        多槽位：按 agent_id 独立保存，多架无人机的确认请求不会互相覆盖；
+        用户确认后由 _handle_user_plan_confirm 按各自 correlation_id 回发 reply。
+        """
+        payload = msg.get("payload") or {}
+        from_id = msg.get("from", "")
+        task_id = payload.get("task_id", "")
+        task_name = payload.get("task_name", "")
+        plan_type = payload.get("plan_type", "macro_plan")
+        plan_data = payload.get("plan_data", []) or []
+        correlation_id = msg.get("correlation_id")
+
+        # 展示方案内容
+        plan_text = ""
+        if plan_type == "detail_plan":
+            for i, a in enumerate(plan_data, 1):
+                plan_text += f"{i}. {a.get('action_name', '')}\n"
+        else:
+            for p in plan_data:
+                plan_text += f"- {p.get('phase_name', p.get('phase_id', ''))}\n"
+        label = "详细规划" if plan_type == "detail_plan" else "宏观规划"
+
+        awaiting = state.setdefault("_awaiting_user_confirm", {})
+        awaiting[from_id] = {
+            "agent_id": from_id,
+            "task_id": task_id,
+            "task_name": task_name,
+            "correlation_id": correlation_id,
+            "plan_type": plan_type,
+            "label": label,
+            "plan_text": plan_text,
+        }
+        state["_sub_awaiting"] = task_id
+        question = self._build_confirm_question(state)
+        state["pending_question"] = question
+        state["output"] = question
+        sys.stderr.write(
+            f"[Fleet] {from_id} 的{label}待用户确认: {task_id}"
+            f"（当前共 {len(awaiting)} 个待确认，按到达顺序逐个确认）\n"
+        )
+        sys.stderr.flush()
+
+    def _build_confirm_question(self, state: AgentState) -> str:
+        """返回队首（最先到达）的待确认规划方案问题；其余待确认的排队等待，不合并展示"""
+        awaiting = state.get("_awaiting_user_confirm") or {}
+        if not awaiting:
+            return ""
+        info = next(iter(awaiting.values()))
+        return (
+            f"{info['agent_id']} 的任务「{info['task_name']}」{info['label']}方案待确认：\n"
+            f"{info['plan_text'] or '（无内容）'}\n"
+            f"请确认（输入确认继续）。"
+        )
+
+    async def _handle_user_plan_confirm(self, state: AgentState, user_input: str):
+        """用户回答规划确认问题：确认→回发 user_confirm reply；修改意见→回发 user_reject（子 agent 重新规划）。
+
+        多槽位 + 逐条确认：默认处理最先到达（队首）的待确认方案，其余排队等待；
+        也可输入“UAV_xx 确认/修改意见”指定处理某一架（其余保留，不覆盖、不丢失）。
+        """
+        awaiting = state.get("_awaiting_user_confirm") or {}
+        text = (user_input or "").strip()
+        confirm_words = ("确认", "确定", "同意", "可以", "好的", "好", "ok", "yes", "是", "继续", "没问题")
+
+        if not awaiting:
+            sys.stderr.write("[Fleet] 收到规划确认回复但缺少等待信息\n")
+            sys.stderr.flush()
+            return
+
+        # 单独处理：输入以 agent_id 开头（如 "UAV_2 确认" / "UAV_2 返程重新规划"）时只作用于该无人机
+        m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*[:：]?\s*(\S.*)$", text)
+        if m and m.group(1) in awaiting:
+            pending = [awaiting[m.group(1)]]
+            text = m.group(2).strip()
+        else:
+            pending = [next(iter(awaiting.values()))]
+
+        if text in confirm_words or text in ("确认继续",):
+            for info in pending:
+                await self._send_reply(
+                    state, info["agent_id"],
+                    "指挥已确认你的规划方案，请继续。",
+                    info["correlation_id"],
+                    payload={"kind": "user_confirm"},
+                )
+        else:
+            for info in pending:
+                await self._send_reply(
+                    state, info["agent_id"],
+                    f"用户要求修改规划方案：{text}",
+                    info["correlation_id"],
+                    payload={"kind": "user_reject", "feedback": text},
+                )
+
+        # 清理已处理的槽位；其余无人机的确认请求保留（不覆盖、不丢失）
+        for info in pending:
+            awaiting.pop(info["agent_id"], None)
+        state["user_input"] = ""
+        if awaiting:
+            remaining = next(iter(awaiting.values()))
+            state["_sub_awaiting"] = remaining["task_id"]
+            question = self._build_confirm_question(state)
+            state["pending_question"] = question
+            state["output"] = question
+        else:
+            state["_awaiting_user_confirm"] = {}
+            state["_sub_awaiting"] = ""
+            state["pending_question"] = ""
+            state["output"] = ""
+
     async def _handle_user_param_answer(self, state: AgentState, user_input: str):
         """用户回答了指挥的缺参问题：LLM 提取参数值 → 回发 reply 给无人机 → 清理等待状态"""
         info = state.get("_awaiting_user_param") or {}
@@ -660,7 +607,10 @@ class FleetManager:
                 "1. 数值型参数（如频率、带宽、功率）必须**保留原始值及其单位**，禁止剥离单位、禁止丢失单位。"
                 "例如用户回答 \"2GHz\" 应提取为 \"2GHz\"（值与单位一起保留），而不是 2。\n"
                 "2. 单位为 GHz/MHz/kHz/Hz/dBm/W 等时，作为字符串保留（如 \"2GHz\" 或 \"3MHz\"）。\n"
-                "3. 坐标参数仍用 x,y 格式。\n\n"
+                "3. 坐标参数仍用 x,y 格式。\n"
+                "4. 若缺失参数中同时含最低频率和最高频率（如 minFreq/maxFreq、targetMinFreq/targetMaxFreq），"
+                "而用户用范围回答（如 \"2GHz到3GHz\"、\"1~2GHz\"、\"2GHz 至 3GHz\"），则拆成两个值分别填入"
+                "（minFreq 填下限、maxFreq 填上限，保留单位）。\n\n"
                 "只输出 JSON 对象，key 为参数名，value 为保留单位的值字符串。"
                 "若某个参数无法从回答中得到明确值，则不输出该 key。"
                 "若全部无法提取，输出 {}。"
@@ -738,18 +688,19 @@ class FleetManager:
             "【上下文字段规范（必须遵守）】\n"
             "1. 模板中 uavs/targets/base 的位置字段只有 Longitude 和 Latitude，坐标为 x,y 格式需拆成两条。\n"
             "2. 坐标值 \"x,y\" 拆成 uavs.N.Longitude 与 uavs.N.Latitude（或 targets 对应条目）。\n"
-            "3. 目标参数（如频率、带宽、信号强度）写入对应 target 条目（用 id 定位，如 targets.T1.Frequency）。\n"
-            "4. 无人机自身属性写 uavs 条目（如 uavs.UAV_1.Frequency）。\n"
-"5. 确实无处安放时，可新增通用字段但没有更好的位置则返回 {}\n\n"
+            "3. 目标参数（如频率、带宽、信号强度）写入对应 target 条目（用 id 定位，如 targets.T1.minFreq、targets.T1.maxFreq）。\n"
+            "4. 无人机自身属性写 uavs 条目（如 uavs.UAV_1.minFreq）。\n"
+            "5. 确实无处安放时，可新增通用字段但没有更好的位置则返回 {}\n\n"
             "【值单位规则】\n"
             "1. **保留用户提供的值和单位**，禁止剥离单位、禁止换算。如 \"2GHz\" 就写 \"2GHz\"。\n"
-            "2. 坐标字符串（x,y）拆成 Longitude 与 Latitude 两条（唯一需要拆分的情况）。\n\n"
+            "2. 坐标字符串（x,y）拆成 Longitude 与 Latitude 两条。\n"
+            "3. 频率范围字符串（如 \"2GHz~3GHz\"、\"2GHz到3GHz\"）拆成 minFreq（下限）与 maxFreq（上限）两条，值保留单位。\n\n"
             "【结果归属判断】\n"
             "1. 优先写入 task_id 对应的 target（如 task_id=T1 与 target.id=T1）。\n"
             "2. 无法确定目标时，根据参数名语义放入 target 第一项。\n\n"
             "请输出 JSON 对象表示要更新到 Redis 的字段映射。\n",
-            'key 为点号分隔路径（如 "targets.T1.Frequency"），value 为带单位的参数值。'
-            "value 若是不带单位的坐标字符串，拆成经度/纬度两条。"
+            'key 为点号分隔路径（如 "targets.T1.minFreq"），value 为带单位的参数值。'
+            "value 若是不带单位的坐标字符串，拆成经度/纬度两条；若是频率范围字符串，拆成 minFreq/maxFreq 两条。"
         ]
         prompt = "".join(prompt_parts)
 
@@ -783,8 +734,28 @@ class FleetManager:
 
     # ─────────────────────────────────────────────────────────────
     
+    async def _dispatch_task_via_kafka(self, state: AgentState, agent, task: dict):
+        """通过 Kafka 向子 agent 派发任务（替代直接方法调用 assign_task）
+
+        携带任务对象，子 agent 收到后自行 宏观规划→确认→详细规划→确认→执行。
+        """
+        if not self._bus:
+            sys.stderr.write("[Fleet] Kafka 总线不可用，无法派发任务\n")
+            sys.stderr.flush()
+            return
+        session_id = state.get("session_id", "default")
+        payload = {
+            "session_id": session_id,
+            "task": task,
+        }
+        await self._bus.send(
+            self._COORD_ID, agent.agent_id, "task",
+            f"指挥分配子任务: {task.get('task_name', '')}",
+            payload=payload,
+        )
+
     async def tick(self, state: AgentState):
-        """推进一步：按顺序执行子任务"""
+        """推进一步：逐 agent 推进生命周期（派发就绪任务 / 推进运行 / 完成收尾）"""
         # 首次 tick：清空各收件箱残留消息（此时本会话尚未产生任何消息，安全）
         if self._bus and state.get("_fleet_tick_count", 0) == 0:
             await self._bus.flush_inbox(self._COORD_ID)
@@ -795,216 +766,91 @@ class FleetManager:
         await self._process_coordinator_inbox(state)
 
         sub_tasks = state.get("sub_tasks", [])
-        shared = state.get("shared_results", {})
-        
-        current_task_idx = state.get("_current_task_idx", 0)
-        
+
         # 安全限制：防止无限循环
         tick_count = state.setdefault("_fleet_tick_count", 0) + 1
         state["_fleet_tick_count"] = tick_count
-        print(f"[DEBUG tick #{tick_count}] idx={current_task_idx} phase={self._phase} all_done={state.get('_fleet_all_done')} sub_awaiting={state.get('_sub_awaiting','')}", file=sys.stderr, flush=True)
+        print(f"[DEBUG tick #{tick_count}] all_done={state.get('_fleet_all_done')} sub_awaiting={state.get('_sub_awaiting','')}", file=sys.stderr, flush=True)
         if tick_count > 200:
             state["_fleet_all_done"] = True
             state["output"] = "[Fleet] 超过最大 tick 次数，强制结束"
             return
-        
-        all_planned = all(
-            t.get("task_id") in self._planned_tasks for t in sub_tasks
-        )
-        if current_task_idx >= len(sub_tasks) or (
-            self._phase == "planning" and all_planned
-        ):
-            if self._phase == "planning":
-                self._phase = "execution"
-                state["_current_task_idx"] = 0
-                has_work = any(
-                    t.get("task_id") in self._planned_tasks
-                    for t in sub_tasks
-                )
-                if not has_work:
-                    state["_fleet_all_done"] = True
-            else:
-                # idx 越界时先确认是否还有未完成的任务
-                remaining = [t for t in sub_tasks if t.get("task_id") not in self._completed_tasks]
-                if remaining:
-                    next_id = remaining[0]["task_id"]
-                    for i, t in enumerate(sub_tasks):
-                        if t.get("task_id") == next_id:
-                            state["_current_task_idx"] = i
-                            break
-                    return
-                state["_fleet_all_done"] = True
-            return
-        
-        current_task = sub_tasks[current_task_idx]
-        task_id = current_task.get("task_id", "")
-        executor = current_task.get("executor", "uav")
-        
-        # 已完成则跳到下一个
-        if task_id in self._completed_tasks:
-            state["_current_task_idx"] = current_task_idx + 1
-            return
-        
-        # 扫描全部未完成任务，找到第一个前置依赖就绪的
-        found = False
-        for scan_idx in range(0, len(sub_tasks)):
-            scan_task = sub_tasks[scan_idx]
-            scan_id = scan_task.get("task_id", "")
-            if scan_id in self._completed_tasks:
-                continue
-            # 规划阶段跳过已规划的任务，执行阶段跳过已规划或在执行的
-            if self._phase == "planning" and scan_id in self._planned_tasks:
-                continue
-            prereqs = scan_task.get("prerequisite_tasks", [])
-            if self._phase == "execution":
-                prereqs_ok = all(p in self._completed_tasks for p in prereqs)
-            else:
-                prereqs_ok = all(p in self._planned_tasks | self._completed_tasks for p in prereqs)
-            if prereqs_ok:
-                if scan_idx != current_task_idx:
-                    state["_current_task_idx"] = scan_idx
-                    current_task_idx = scan_idx
-                    current_task = scan_task
-                    task_id = scan_id
-                    executor = scan_task.get("executor", "uav")
-                found = True
-                break
-        
-        if not found:
-            print(f"[DEBUG tick #{tick_count}] NO executable task found (deadlock at idx={current_task_idx})", file=sys.stderr, flush=True)
-            state["_fleet_all_done"] = True
-            state["output"] = "[Fleet] 所有任务被前置依赖阻塞，无法继续执行"
-            return
-        
-        # ====== 所有子任务通过 agent 生命周期执行 ======
-        agent_id = self.task_to_agent.get(task_id)
-        if not agent_id:
-            self._completed_tasks.add(task_id)
-            state["_current_task_idx"] = current_task_idx + 1
-            return
-        
-        # 获取对应的 agent（UAV 子 agent / processor）
-        if agent_id == self._PROCESSOR_ID:
-            agent = self._processor_agent
+
+        # 任务是否已全部完成（_current_task_idx 仅供展示）
+        remaining = [t for t in sub_tasks if t.get("task_id") not in self._completed_tasks]
+        if remaining:
+            first_id = remaining[0]["task_id"]
+            for i, t in enumerate(sub_tasks):
+                if t.get("task_id") == first_id:
+                    state["_current_task_idx"] = i
+                    break
         else:
-            agent = self.sub_agents.get(agent_id)
-        
-        if not agent:
-            self._completed_tasks.add(task_id)
-            state["_current_task_idx"] = current_task_idx + 1
+            state["_fleet_all_done"] = True
             return
 
-        is_processor_task = agent_id == self._PROCESSOR_ID
+        # 阶段1（串行）：完成/出错归档 + 重置 + 派发就绪任务（操作共享状态，必须串行）
+        for agent_id, agent in list(self.sub_agents.items()) + [(self._PROCESSOR_ID, self._processor_agent)]:
+            if agent is None:
+                continue
+            await self._tick_agent(state, agent_id, agent, sub_tasks)
 
-        # 信息处理任务：规划阶段不运行分析 agent（无宏观/详细规划），直接视为已规划，
-        # 执行阶段（前置采集任务完成后）再跑分析图直接调工具完成
-        if is_processor_task and self._phase == "planning":
-            self._planned_tasks.add(task_id)
-            self._running_tasks.discard(task_id)
-            state["_current_task_idx"] = current_task_idx + 1
-            self._update_fleet_state(state)
-            return
-
-        # 如果子agent空闲，分配任务
-        if agent.status == "idle":
-            prereq_results = {p: shared.get(p, {}) for p in prereqs}
-            print(f"[FLEET] 分配任务 {task_id}({current_task.get('task_name','')}) → agent={agent_id}", file=sys.stderr, flush=True)
-            for pid, pval in prereq_results.items():
-                summary = str(pval.get("output", ""))[:120]
-                has_actions = len(pval.get("detail_actions", []))
-                print(f"[FLEET]   前置 {pid}: output={summary!r} actions_count={has_actions} status={pval.get('status','')}", file=sys.stderr, flush=True)
-            enriched_task = {**current_task}
-            enriched_task["prerequisite_results"] = prereq_results
-            
-            if self._phase == "execution" and task_id in self._saved_plans:
-                # 执行阶段：跳过规划，直接注入已保存的详细规划
-                plan = self._saved_plans[task_id]
-                agent.assign_task(enriched_task)
-                # 覆盖子 agent 状态，直接进入执行模式
-                agent.state["detail_actions"] = plan["detail_actions"]
-                agent.state["detail_plan_done"] = True
-                agent.state["detail_plan_confirmed"] = True
-                agent.state["current_step_idx"] = 0
-                agent.state["plan_generated"] = True
-                agent.state["macro_plan_confirmed"] = True
-            else:
-                # 规划阶段：正常分配任务
-                agent.assign_task(enriched_task)
-            self._running_tasks.add(task_id)
-        
-        # 每 tick 执行一步
-        if agent.status == "running":
-            # 规划阶段：用户确认详规 → 不执行 run_step，直接保存规划
-            if self._phase == "planning":
-                s = agent.state
-                if (s.get("detail_plan_done") and not s.get("detail_plan_confirmed")
-                        and not s.get("pending_question") and s.get("user_input")):
-                    s["detail_plan_confirmed"] = True
-                    actions = list(s.get("detail_actions", []))
-                    if actions:
-                        self._planned_tasks.add(task_id)
-                        self._saved_plans[task_id] = {"detail_actions": actions}
-                        shared[task_id] = {
-                            "status": "planned",
-                            "detail_actions": actions,
-                            "output": s.get("output", ""),
-                            "progress": 0.0,
-                        }
-                        self._running_tasks.discard(task_id)
-                        agent.reset_for_next_task()
-                        state["_current_task_idx"] = current_task_idx + 1
-                        self._update_fleet_state(state)
-                        return
-                    # 无 actions → 直接视为完成
-                    self._planned_tasks.add(task_id)
-                    self._running_tasks.discard(task_id)
-                    agent.reset_for_next_task()
-                    state["_current_task_idx"] = current_task_idx + 1
-                    self._update_fleet_state(state)
-                    return
-            
-            await agent.run_step()
-
-            # 保存子agent状态到 Redis
+        # 阶段2（并行）：所有 agent 的 run_step 并发推进（RAG/LLM 调用时间重叠，真并行）
+        all_agents = [a for _, a in list(self.sub_agents.items()) + [(self._PROCESSOR_ID, self._processor_agent)] if a is not None]
+        if all_agents:
+            await asyncio.gather(*[a.run_step() for a in all_agents])
             if self.redis_mgr:
-                self.redis_mgr.save_agent_state(agent_id, agent.state)
-            
-            # 诊断：读取子 agent 实际状态
-            _actual_pq = agent.state.get("pending_question", "")
-            _actual_dpc = agent.state.get("detail_plan_confirmed", False)
-            _actual_dpd = agent.state.get("detail_plan_done", False)
-            _actual_ui = agent.state.get("user_input", "")
-            
-            # 子agent有等待用户确认的问题，传播到 coordinator（信息处理任务除外，输出即完成）
-            if (agent.has_pending_question or _actual_pq) and not is_processor_task:
-                if not agent.has_pending_question:
-                    print(f"[DEBUG tick] has_pending_question=False but state.pending_question='{_actual_pq[:50]}' (fallback)", file=sys.stderr, flush=True)
-                state["_sub_awaiting"] = task_id
-                state["pending_question"] = _actual_pq
-                state["output"] = agent.state.get("output", "")
-                print(f"[DEBUG tick] PENDING_QUESTION -> _sub_awaiting={task_id}", file=sys.stderr, flush=True)
+                for a in all_agents:
+                    self.redis_mgr.save_agent_state(a.agent_id, a.state)
+
+        # 死锁检测：仍有未完成任务，但没有任何 agent 在运行（且没有可派发的就绪任务）
+        any_running = any(a.status == "running" for a in self.sub_agents.values()) or (
+            self._processor_agent is not None and self._processor_agent.status == "running"
+        )
+        if remaining and not any_running:
+            all_agents = list(self.sub_agents.values()) + ([self._processor_agent] if self._processor_agent else [])
+            idle_with_work = any(self._find_ready_task(a, sub_tasks) is not None for a in all_agents)
+            if not idle_with_work:
+                print(f"[DEBUG tick #{tick_count}] NO executable task found (deadlock)", file=sys.stderr, flush=True)
+                state["_fleet_all_done"] = True
+                state["output"] = "[Fleet] 所有任务被前置依赖阻塞，无法继续执行"
                 return
-            
-            if _actual_dpc:
-                print(f"[DEBUG tick] agent status after run_step: status={agent.status} pq={bool(_actual_pq)} dpc={_actual_dpd} sidx={agent.state.get('current_step_idx', -1)} is_done={agent.is_done}", file=sys.stderr, flush=True)
-            
-            # 子agent完成（执行阶段）
-            if agent.is_done:
-                if self._phase == "planning":
-                    shared[task_id] = {
-                        "status": "planned",
-                        "output": agent.last_output,
-                        "progress": 1.0,
-                    }
-                else:
-                    # 执行阶段：真正完成
-                    self._completed_tasks.add(task_id)
-                    shared[task_id] = {
-                        "status": "done",
-                        "output": agent.last_output,
-                        "progress": 1.0,
-                        "detail_actions": agent.state.get("detail_actions", []),
-                    }
+        
+        # 更新 fleet 状态
+        self._update_fleet_state(state)
+
+    def _find_ready_task(self, agent, sub_tasks: list) -> dict | None:
+        """按分配顺序找到该 agent 第一个「未完成且前置依赖就绪」的任务"""
+        for tid in agent._assigned_task_ids:
+            if tid in self._completed_tasks:
+                continue
+            task = next((t for t in sub_tasks if t.get("task_id") == tid), None)
+            if not task:
+                continue
+            prereqs = task.get("prerequisite_tasks", [])
+            if all(p in self._completed_tasks for p in prereqs):
+                return task
+        return None
+
+    async def _tick_agent(self, state: AgentState, agent_id: str, agent, sub_tasks: list):
+        """单个 agent 的串行阶段：完成收尾 + 派发就绪任务（run_step 由 tick 的并行阶段统一 gather 调用）"""
+        shared = state.setdefault("shared_results", {})
+        task = agent._current_task or {}
+
+        # 完成/出错：归档结果 + 重置 agent，准备下一个任务
+        if agent.is_done:
+            tid = task.get("task_id", "")
+            if tid and tid not in self._completed_tasks:
+                self._completed_tasks.add(tid)
+                shared[tid] = {
+                    "status": "done",
+                    "output": agent.last_output,
+                    "progress": 1.0,
+                    "detail_actions": agent.state.get("detail_actions", []),
+                }
+                if agent.status == "error":
+                    shared[tid]["error"] = agent.error
+                    sys.stderr.write(f"[Fleet] {agent_id} 任务 {tid} 执行出错: {agent.error}\n")
+                    sys.stderr.flush()
                 # 任务完成：LLM 兜底补全字段血缘依赖（无未匹配字段时零开销直接返回）
                 try:
                     await refresh_dependencies_with_llm(
@@ -1014,13 +860,23 @@ class FleetManager:
                 except Exception as e:
                     sys.stderr.write(f"[Fleet] LLM 依赖兜底失败: {e}\n")
                     sys.stderr.flush()
-                
-                self._running_tasks.discard(task_id)
-                agent.reset_for_next_task()
-                state["_current_task_idx"] = current_task_idx + 1
-        
-        # 更新 fleet 状态
-        self._update_fleet_state(state)
+            agent.reset_for_next_task()
+
+        # idle：找就绪任务并通过 Kafka 派发（每个任务只派发一次）
+        if agent.status == "idle":
+            ready_task = self._find_ready_task(agent, sub_tasks)
+            if ready_task:
+                tid = ready_task.get("task_id", "")
+                if tid not in self._dispatched_tasks:
+                    prereq_results = {p: shared.get(p, {}) for p in ready_task.get("prerequisite_tasks", [])}
+                    enriched_task = {**ready_task, "prerequisite_results": prereq_results}
+                    print(f"[FLEET] Kafka 派发任务 {tid}({ready_task.get('task_name','')}) → agent={agent_id}", file=sys.stderr, flush=True)
+                    for pid, pval in prereq_results.items():
+                        summary = str(pval.get("output", ""))[:120]
+                        has_actions = len(pval.get("detail_actions", []))
+                        print(f"[FLEET]   前置 {pid}: output={summary!r} actions_count={has_actions} status={pval.get('status','')}", file=sys.stderr, flush=True)
+                    await self._dispatch_task_via_kafka(state, agent, enriched_task)
+                    self._dispatched_tasks.add(tid)
     
     def _update_fleet_state(self, state: AgentState):
         """将各子agent状态汇总到 uav_states"""

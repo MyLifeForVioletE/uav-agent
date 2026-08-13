@@ -39,7 +39,7 @@ class SubAgent:
         self.deps = self._filter_deps(deps)
         self.redis_mgr = redis_mgr
         self._session_id = session_id
-        # 分析 agent 用 3 节点极简图；其余复用 6 节点单机图
+        # 分析 agent 用 3 节点极简图；其余复用 6 节点执行图
         self.graph = build_analyst_graph(self.deps) if mode == "processor" else build_graph(self.deps)
         self.state = self._init_state()      # 独立状态实例
         self.status = "idle"                  # idle | running | done | error
@@ -55,6 +55,7 @@ class SubAgent:
         # Kafka 消息总线（三种 agent 间通信）
         self._bus = get_kafka_bus()
         self._awaiting_reply: str | None = None   # 同步请示：等待的 correlation_id
+        self._plan_confirm_requested: str | None = None   # 已请求用户确认的规划类型（macro_plan/detail_plan）
 
         # 规划上报：宏观/详细规划已上报标记（避免重复上报）
         self._reported_macro_plan = False
@@ -165,6 +166,10 @@ class SubAgent:
                 sys.stderr.write(f"[SubAgent {self.agent_id}] 丢弃非本会话消息({mtype}): {content[:60]}\n")
                 sys.stderr.flush()
                 continue
+            if mtype == "task":
+                # 指挥通过 Kafka 派发的子任务
+                await self._handle_task_assignment(m)
+                continue
             if mtype in ("instruction", "reply"):
                 if mtype == "reply" and self._awaiting_reply:
                     if m.get("correlation_id") == self._awaiting_reply:
@@ -245,10 +250,26 @@ class SubAgent:
         self.state["original_scenario"] = task.get("goal", "")
         self.state["_is_sub_task"] = True
     
+    async def _handle_task_assignment(self, msg: dict):
+        """接收指挥通过 Kafka 派发的子任务并注入状态（替代指挥直接方法调用）"""
+        payload = msg.get("payload") or {}
+        task = payload.get("task") or {}
+        if not task:
+            sys.stderr.write(f"[SubAgent {self.agent_id}] 收到空任务派发，忽略\n")
+            sys.stderr.flush()
+            return
+        self.assign_task(task)
+        sys.stderr.write(f"[SubAgent {self.agent_id}] 收到指挥派发任务: {task.get('task_name', '')}\n")
+        sys.stderr.flush()
+    
     async def run_step(self):
         """执行一步（调用 graph.ainvoke 或直接执行已保存的原子动作）"""
-        # 先拉取收件箱：注入指挥指令；收到匹配的回复则解除同步请示挂起
+        # 先拉取收件箱：注入指挥指令；收到任务派发则进入 running；收到匹配的回复则解除同步请示挂起
         await self._drain_inbox()
+
+        # 尚未收到任务派发（仍 idle 且无当前任务）：本 tick 不推进
+        if self.status == "idle" and not self._current_task:
+            return
 
         # 同步请示挂起：请求已发出但指挥尚未回复 → 本 tick 不推进
         if self._awaiting_reply:
@@ -293,6 +314,10 @@ class SubAgent:
             self._sync_status()
             # 向指挥上报已生成的宏观/详细规划
             await self._report_plans_if_ready()
+            # 规划产出待用户确认 → 通过指挥转达（plan_confirm 请示），挂起等待回复
+            if self._needs_plan_confirm():
+                await self._request_plan_confirmation()
+                return
         except Exception as e:
             self.status = "error"
             self.error = str(e)
@@ -314,6 +339,10 @@ class SubAgent:
         """直接从 detail_actions 中执行下一步，不经过 LLM"""
         actions = self.state.get("detail_actions", [])
         idx = self.state.get("current_step_idx", 0)
+        # 执行未开始（-1 哨兵）时从第一步开始，避免 actions[-1] 误取最后一步
+        if idx < 0:
+            idx = 0
+            self.state["current_step_idx"] = 0
 
         if idx >= len(actions):
             self.status = "done"
@@ -341,6 +370,7 @@ class SubAgent:
             "messages": self.state["messages"],
             "llm": self.deps.llm_no_tools,
             "state": self.state,
+            "agent_id": self.agent_id,
         }
 
         # 向指挥上报当前正在执行的动作（处理前先报一次，让指挥感知执行开始）
@@ -373,10 +403,9 @@ class SubAgent:
         self.last_output = result.get("output", "")
         self.state["output"] = self.last_output
         
-        # 执行成功后：位置更新仍由 UAV 直写 Redis；算法结果（扫频等）发给指挥，由指挥提取并写 Redis
+        # 执行成功后：上下文更新由执行 agent 用代码确定性写入 Redis（航迹/位置由
+        # tool_executor 直接落库，stub 算法输出保持空占位）；算法原始输出上报指挥仅供归档。
         if result.get("success"):
-            if action.get("post_action_update") and self.redis_mgr:
-                await self._apply_post_action_update(action, result)
             if action.get("executor") == "tool":
                 await self._report_result_to_coordinator(action, result)
 
@@ -475,6 +504,66 @@ class SubAgent:
             sys.stderr.write(f"[SubAgent {self.agent_id}] {report_type} 上报失败: {e}\n")
             sys.stderr.flush()
 
+    def _needs_plan_confirm(self) -> bool:
+        """宏观/详细规划已产出、待用户确认，且尚未发出确认请求时返回 True"""
+        if self._awaiting_reply or self._plan_confirm_requested:
+            return False
+        s = self.state
+        if not s.get("pending_question"):
+            return False
+        if s.get("detail_plan_done") and not s.get("detail_plan_confirmed"):
+            return True
+        if s.get("plan_generated") and not s.get("macro_plan_confirmed"):
+            return True
+        return False
+
+    async def _request_plan_confirmation(self):
+        """规划产出待用户确认：向指挥发送 plan_confirm 请示并挂起，等待指挥转达用户后回复"""
+        if not self._bus:
+            return
+        correlation_id = new_msg_id()
+        s = self.state
+        task = self._current_task or {}
+        if s.get("detail_plan_done") and not s.get("detail_plan_confirmed"):
+            plan_type = "detail_plan"
+            plan_data = s.get("detail_actions", [])
+        else:
+            plan_type = "macro_plan"
+            plan_data = s.get("macro_phases", [])
+            if not plan_data:
+                # state 中未解析出宏观阶段时，回退从消息历史提取宏观规划 JSON
+                from agent.nodes.planning import _find_macro_plan_json
+                plan_data = _find_macro_plan_json(s.get("messages", [])) or []
+        payload = {
+            "request_type": "plan_confirm",
+            "plan_type": plan_type,
+            "plan_data": plan_data,
+            "task_id": task.get("task_id", ""),
+            "task_name": task.get("task_name", ""),
+        }
+        try:
+            await self._send_message(
+                COORDINATOR_ID, "request",
+                f"{self.agent_id} 的{('详细规划' if plan_type == 'detail_plan' else '宏观规划')}需要用户确认",
+                payload=payload,
+                correlation_id=correlation_id,
+            )
+        except Exception as e:
+            sys.stderr.write(f"[SubAgent {self.agent_id}] 规划确认请求失败: {e}\n")
+            sys.stderr.flush()
+            self.status = "error"
+            self.error = f"规划确认请求失败: {e}"
+            return
+
+        self._awaiting_reply = correlation_id
+        self._plan_confirm_requested = plan_type
+        self.state["pending_question"] = ""
+        self.status = "running"
+        self.last_output = "规划方案已提交，等待用户确认..."
+        self.state["output"] = self.last_output
+        sys.stderr.write(f"[SubAgent {self.agent_id}] {plan_type} 已请求用户确认，挂起等待\n")
+        sys.stderr.flush()
+
     async def _request_param_resolution(self, action: dict, missing_params: list):
         """缺参：向指挥发送 request，等待指挥回复（推导算法 / 询问用户）"""
         if not self._bus:
@@ -555,6 +644,26 @@ class SubAgent:
             self.last_output = f"已收到指挥提供的参数值: {values}"
             self.state["output"] = self.last_output
             self.state["pending_question"] = ""
+        elif kind == "user_confirm":
+            # 用户已确认规划方案：宏观确认 → 触发详细规划链路；详细确认 → 直接进入执行
+            self._plan_confirm_requested = None
+            self.state["pending_question"] = ""
+            if self.state.get("detail_plan_done") and not self.state.get("detail_plan_confirmed"):
+                self.state["detail_plan_confirmed"] = True
+                self.state["_intent"] = "chat"
+            elif self.state.get("plan_generated") and not self.state.get("macro_plan_confirmed"):
+                self.state["user_input"] = "确认"
+                self.state["_intent"] = "confirm"
+            self.last_output = "规划方案已确认，继续执行"
+            self.state["output"] = self.last_output
+        elif kind == "user_reject":
+            # 用户要求修改规划：把修改意见注入，重新规划
+            self._plan_confirm_requested = None
+            feedback = payload.get("feedback", "") or content
+            self.state["pending_question"] = ""
+            self.state["user_input"] = f"用户要求修改规划方案，请按以下意见重新规划：{feedback}"
+            self.last_output = "用户要求修改规划，重新规划中..."
+            self.state["output"] = self.last_output
         else:
             self.state["messages"].append(SystemMessage(content=f"[指挥回复] {content}"))
             if content and not self.state.get("pending_question"):
@@ -585,110 +694,8 @@ class SubAgent:
             sys.stderr.flush()
 
     async def _apply_post_action_update(self, action: dict, result: dict):
-        """执行后根据 post_action_update 更新 Redis 上下文"""
-        post_action_update = action.get("post_action_update", "")
-        if not post_action_update or not self.redis_mgr:
-            return
-
-        # 非真实执行 exe 的工具（如扫频侦察、signalAnalysis）：输出仅为空占位，
-        # 已由 tool_executor._write_output_placeholders 写入，这里不允许 LLM 再编造结果值覆盖占位。
-        tool_name = action.get("tool_name", "")
-        if tool_name != "path_planning":
-            sys.stderr.write(f"[SubAgent {self.agent_id}] {tool_name} 非 exe 执行，跳过 post_action_update（输出为空占位）\n")
-            sys.stderr.flush()
-            return
-        
-        import json
-        import requests
-        
-        from core.config import OLLAMA_BASE, MODEL
-        
-        tool_inputs = action.get("tool_inputs", {})
-        goal = action.get("goal", "")
-        
-        current_context = self.redis_mgr.get_context(self._session_id) or {}
-        
-        # 获取工具的 input_schema 参数定义，帮助 LLM 理解参数含义
-        tool_params = ""
-        tool_name = action.get("tool_name", "")
-        if tool_name:
-            try:
-                algo_path = __import__("core.config", fromlist=["BASE_DIR"]).BASE_DIR / "algorithms.json"
-                with open(algo_path, encoding="utf-8") as f:
-                    algos = {a["name"]: a for a in __import__("json").load(f).get("capabilities", [])}
-                schema = algos.get(tool_name, {}).get("input_schema", {})
-                if schema:
-                    lines = ["【工具参数定义】"]
-                    for pname, pinfo in schema.items():
-                        lines.append(f"- {pname}: {pinfo.get('description', pname)}")
-                    tool_params = "\n".join(lines) + "\n\n"
-            except Exception:
-                pass
-        
-        prompt_parts = [
-            "你是一个任务执行系统的上下文更新模块。\n",
-            "根据以下信息，确定执行完当前动作后需要更新 Redis 中的哪些字段。\n\n",
-            f"【当前无人机】{self.agent_id}\n\n",
-            f"【动作目标】{goal}\n\n",
-            f"【需要执行的上下文更新】{post_action_update}\n\n",
-            f"【已解析的工具参数】{json.dumps(tool_inputs, ensure_ascii=False)}\n\n",
-            tool_params,
-            f"【当前 Redis 上下文】{json.dumps(current_context, ensure_ascii=False)}\n\n",
-            "【上下文字段规范（必须遵守）】\n"
-            "1. 模板中 uavs/targets/base 的位置字段只有 Longitude 和 Latitude，不存在 position/x/y 字段。\n"
-            "2. 更新位置时必须写入 Longitude 和 Latitude 两个字段，例如 uavs.0.Longitude、uavs.0.Latitude。\n"
-            "3. 坐标值若是 \"70,15.01\" 这类用逗号分隔的字符串，必须拆成两条分别写入 Longitude（70）和 Latitude（15.01）。\n"
-            "4. 禁止输出 position 字段；输出前检查一遍，确保没有生成模板之外的字段。\n\n"
-            "分析思路：\n"
-            "1. 先理解 post_action_update 指令要做什么（如「将无人机当前位置更新为目标位置坐标」）\n"
-            "2. 在 tool_inputs 中找到对应的参数值（「目标位置」→destination 的值）\n"
-            "3. 在 Redis 上下文中找到要更新的路径（「无人机当前位置」→uavs.0.Longitude 与 uavs.0.Latitude）\n"
-            "4. 注意区分 tool_inputs 中哪些是输入（如 startPosition），哪些是动作结果（如 destination 是规划后的新位置）\n\n"
-            "请输出一个 JSON 对象，表示要更新到 Redis 的字段映射。\n"
-            'key 为点号分隔的路径（如 "uavs.0.Longitude" 或 "uavs.UAV_1.Latitude"），\n'
-            "数组既可用数字索引也可用 id 值来定位元素。\n"
-            "value 为具体的数值。"
-        ]
-        prompt = "".join(prompt_parts)
-        
-        try:
-            resp = requests.post(
-                f"{OLLAMA_BASE}/api/chat",
-                json={
-                    "model": MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": False,
-                    "format": "json",
-                    "options": {"temperature": 0, "num_predict": 4096},
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            content = resp.json()["message"]["content"].strip()
-        except Exception as e:
-            sys.stderr.write(f"[SubAgent {self.agent_id}] post_action_update 调用失败: {e}\n")
-            return
-        
-        try:
-            updates = json.loads(content)
-        except json.JSONDecodeError:
-            sys.stderr.write(f"[SubAgent {self.agent_id}] post_action_update 解析失败: {content}\n")
-            return
-        
-        if not updates or not isinstance(updates, dict):
-            return
-        
-        nested = {}
-        for key_path, val in updates.items():
-            parts = key_path.split(".")
-            d = nested
-            for p in parts[:-1]:
-                d = d.setdefault(p, {})
-            d[parts[-1]] = val
-        
-        self.redis_mgr.update_context(self._session_id, nested)
-        sys.stderr.write(f"[SubAgent {self.agent_id}] post_action_update: {json.dumps(nested, ensure_ascii=False)}\n")
-        sys.stderr.flush()
+        """已废弃：上下文更新现由 tool_executor 确定性写入 Redis，不再经 LLM 生成。"""
+        return
 
     def _sync_status(self):
         """从子agent状态同步 status/progress"""
@@ -741,6 +748,7 @@ class SubAgent:
         self.error = None
         self._current_task = None
         self._awaiting_reply = None
+        self._plan_confirm_requested = None
         self._reported_macro_plan = False
         self._reported_detail_plan = False
         self._pending_resolution = None

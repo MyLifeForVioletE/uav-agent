@@ -133,10 +133,10 @@ def _local_resolve_param(context: dict, param_name: str, param_desc: str, param_
                 continue
             for k, v in item.items():
                 if str(k).lower() == pname_lower and str(v).strip():
-                    return pick_component(to_coord_str(v))
+                    return _freq_component(pick_component(to_coord_str(v)), pname_lower, desc_lower)
 
     # 1.5) 别名/后缀匹配：参数名与字段名互为后缀（如 step ↔ frequency_step、
-    #      target_frequency ↔ Frequency）。值一律来自上下文原文，不编造；
+    #      targetMinFreq ↔ minFreq）。值一律来自上下文原文，不编造；
     #      仅当较短一侧长度 >=3 时启用，避免过短关键词误匹配。
     for group in context.values():
         if not isinstance(group, list):
@@ -152,7 +152,7 @@ def _local_resolve_param(context: dict, param_name: str, param_desc: str, param_
                     continue
                 if (kl.endswith(pname_lower) or pname_lower.endswith(kl)) \
                         and min(len(kl), len(pname_lower)) >= 3:
-                    return pick_component(to_coord_str(v))
+                    return _freq_component(pick_component(to_coord_str(v)), pname_lower, desc_lower)
 
     # 2) 坐标参数：按语义分组拼接 Longitude/Latitude（起点→uav/base 分组；终点→目标原文/观测位置/target/base）
     is_start = any(k in pname_lower or k in desc_lower for k in ("start", "起点", "from", "当前位置", "开始", "uav", "outpoint"))
@@ -222,6 +222,8 @@ def _local_resolve_param(context: dict, param_name: str, param_desc: str, param_
     aliases = {
         "start": ["start", "起点", "startposition", "start_position", "uavposition", "uav_position", "当前位置", "uav", "from"],
         "end": ["end", "终点", "endposition", "end_position", "targetposition", "target_position", "目标", "target", "base", "baseposition"],
+        "min_frequency": ["minfreq", "最低频率", "最小频率", "min_frequency", "下限"],
+        "max_frequency": ["maxfreq", "最高频率", "最大频率", "max_frequency", "上限"],
         "frequency": ["frequency", "频率", "freq", "target_frequency"],
         "bandwidth": ["bandwidth", "带宽", "bw"],
         "signal": ["signal_strength", "信号强度", "signal", "场强"],
@@ -243,7 +245,9 @@ def _local_resolve_param(context: dict, param_name: str, param_desc: str, param_
                     continue
                 for k, v in item.items():
                     if str(k).lower() in keys and str(v).strip():
-                        return to_coord_str(v)
+                        # 频率范围兜底：min/max 频率参数命中范围字符串（如旧 Frequency="2~3GHz"）时
+                        # 拆分出对应分量，防止整个范围被当作单值传给算法。
+                        return _freq_component(to_coord_str(v), pname_lower, desc_lower)
 
     return None
 
@@ -349,6 +353,41 @@ def _convert_frequency_to_mhz(value: str):
     else:
         return None  # 未知单位（如 W/dBm），不强行换算
     return str(int(mhz)) if mhz == int(mhz) else str(mhz)
+
+
+def _split_freq_range(value: str):
+    """将频率范围字符串（如 "2~3GHz"、"1GHz到2GHz"、"1-2GHz"）拆成 (最低, 最高)；
+    单位缺失的一侧继承另一侧单位（"1~2GHz" → ("1GHz","2GHz")）；非范围返回 None。"""
+    import re as _re
+    s = str(value or "").strip()
+    m = _re.fullmatch(r"\s*([^~～至到－\-]+?)\s*[~～至到－\-]\s*([^~～至到－\-]+?)\s*", s)
+    if not m:
+        return None
+    lo, hi = m.group(1).strip(), m.group(2).strip()
+
+    def has_unit(x):
+        return bool(_re.search(r"[a-zA-Zμµ]", x))
+
+    if has_unit(hi) and not has_unit(lo):
+        lo = lo + _re.search(r"[a-zA-Zμµ]+", hi).group()
+    elif has_unit(lo) and not has_unit(hi):
+        hi = hi + _re.search(r"[a-zA-Zμµ]+", lo).group()
+    return lo, hi
+
+
+def _freq_component(value, param_name: str, param_desc: str):
+    """min/max 频率参数命中范围字符串时拆出对应分量（min→下限，max→上限）；否则原样返回。"""
+    if not value:
+        return value
+    parts = _split_freq_range(value)
+    if not parts:
+        return value
+    text = f"{param_name} {param_desc}".lower()
+    if any(k in text for k in ("maxfreq", "最高频率", "最大频率", "max_frequency", "上限")):
+        return parts[1]
+    if any(k in text for k in ("minfreq", "最低频率", "最小频率", "min_frequency", "下限")):
+        return parts[0]
+    return value
 
 
 def _build_file_list_text(files: list[dict]) -> str:
@@ -490,7 +529,7 @@ async def _llm_extract_from_context(llm, param_name: str, param_desc: str,
 
 【要求】
 1. 只输出该字段的完整 JSON 点号路径，禁止输出字段的值或任何编造的数据。
-2. 路径格式：数组元素用数字索引或 id 定位（如 targets.0.Frequency 或 targets.T1.Frequency），
+2. 路径格式：数组元素用数字索引或 id 定位（如 targets.0.minFreq 或 targets.T1.minFreq），
    其他逐级用点号拼接（如 base.Longitude、uavs.UAV_1.Latitude）。
 3. 若上下文中不存在与参数语义匹配的字段，输出 "NONE"。
 
@@ -616,7 +655,7 @@ def _extract_output_fields(output: str) -> list:
     return _re.findall(r"[A-Za-z_][A-Za-z0-9_]*", m.group(1))
 
 
-def _write_path_to_redis(redis_mgr, session_id: str, state: dict, tool_inputs: dict, output: str):
+def _write_path_to_redis(redis_mgr, session_id: str, agent_id: str, tool_inputs: dict, output: str):
     """路径规划成功后，将航迹点写入 Redis 上下文（关联到对应的无人机）。
 
     按实体存储：目的地坐标不重复写进无人机航迹（那是 target/base 的职责），
@@ -625,13 +664,13 @@ def _write_path_to_redis(redis_mgr, session_id: str, state: dict, tool_inputs: d
     if not redis_mgr:
         return
     session_id = session_id or "default"
+    agent_id = str(agent_id or "UAV_1").strip()
     waypoints = _parse_waypoints(str(output or ""))
     if not waypoints:
         sys.stderr.write("[ToolExecutor] 未从路径规划输出中解析到航迹点\n")
         sys.stderr.flush()
         return
     try:
-        agent_id = (state or {}).get("_agent_id") or "UAV_1"
         # 起点/终点仅用于日志与 UAV 当前坐标更新，不写入航迹记录
         start_lon = str((tool_inputs.get("startPositionLong") or "")).strip()
         start_lat = str((tool_inputs.get("startPositionLat") or "")).strip()
@@ -655,10 +694,10 @@ def _write_path_to_redis(redis_mgr, session_id: str, state: dict, tool_inputs: d
             ctx["uavs"] = uavs
         for u in uavs:
             if isinstance(u, dict) and u.get("id") == agent_id:
-                u.update({"Longitude": start_lon, "Latitude": start_lat, "path": route})
+                u.update({"Longitude": end_lon, "Latitude": end_lat, "path": route})
                 break
         else:
-            uavs.append({"id": agent_id, "Longitude": start_lon, "Latitude": start_lat,
+            uavs.append({"id": agent_id, "Longitude": end_lon, "Latitude": end_lat,
                          "path": route})
         redis_mgr.save_context(session_id, ctx)
         sys.stderr.write(
@@ -721,7 +760,7 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
     scene_description = state.get("original_scenario", "")
     
     # 执行该动作的无人机 id（用于解析观测位置 mission_position）
-    agent_id = str((state or {}).get("_agent_id") or "").strip()
+    agent_id = str(context.get("agent_id") or (state or {}).get("_agent_id") or "").strip()
     
     # 获取 session_id
     session_id = state.get("session_id", "default")
@@ -819,13 +858,15 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
                 )
                 if extracted_value:
                     extracted_value = _pick_coord_component(extracted_value, param_name, param_desc)
+                    # 频率范围兜底：min/max 频率参数命中范围字符串时拆出对应分量
+                    extracted_value = _freq_component(extracted_value, param_name, param_desc)
                     sys.stderr.write(f"[ToolExecutor] LLM提取: {param_name}={extracted_value}\n")
                     sys.stderr.flush()
                     tool_inputs[param_name] = extracted_value
                     continue
                 elif not real_exec:
                     # 不执行 exe 的算法：LLM 未查到值 → 本地键值/别名直取（值必须来自上下文原文，
-                    # 与 target_frequency 命中 targets.T1.Frequency 同理），仍找不到才留空，
+                    # 与 targetMinFreq 命中 targets.T1.minFreq 同理），仍找不到才留空，
                     # 交给末尾"非 exe 缺参用参数名占位"处理（写脚本时显示参数名）。
                     local_value = _local_resolve_param(context, param_name, param_desc, param_type,
                                                        agent_id=agent_id, goal=goal, scene_text=scene_description)
@@ -963,7 +1004,7 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
 
         # 路径规划成功：把航迹点写入 Redis（关联无人机 + 起终点），并同步到脚本输出
         if real_exec and tool_name == "path_planning":
-            _write_path_to_redis(redis_mgr, session_id, state, tool_inputs, readable)
+            _write_path_to_redis(redis_mgr, session_id, agent_id, tool_inputs, readable)
 
         return {
             "success": True,

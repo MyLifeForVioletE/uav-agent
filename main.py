@@ -81,7 +81,7 @@ async def main():
         print("=" * 60, flush=True)
         print("  模型随时根据你的需求选择合适的算法调用", flush=True)
         print("  复杂任务可以自动进行规划后分步执行", flush=True)
-        print("  多机协同任务会自动检测并切换到多机模式", flush=True)
+        print("  每个任务统一由指挥 agent 协调 UAV/信息处理子 agent 协同执行", flush=True)
         print("  如果缺少信息，模型会主动问你", flush=True)
         print('  输入 "exit" 退出', flush=True)
         print("=" * 60, flush=True)
@@ -90,7 +90,7 @@ async def main():
         llm_plain = ChatOllama(model=MODEL, temperature=0, base_url=OLLAMA_BASE, request_timeout=60)
         deps = Deps(tools=tool_map, llm_no_tools=llm_plain, macro_planner=macro_planner, constraint_planner=constraint_planner, detail_planner=detail_planner, decomposer_planner=decomposer_planner)
         
-        # 构建两个图：单机图 + Coordinator图
+        # 构建 Coordinator 图（入口）；子 agent 内部复用 agent/graph.py 执行图
         coordinator_graph = build_coordinator_graph(deps)
         
         # 初始状态
@@ -114,7 +114,6 @@ async def main():
                 # 追加用户消息到 Redis
                 redis_mgr.append_message(session_id, {"type": "human", "content": user_input})
                 
-                state["collaboration_mode"] = "multi"
                 state = await coordinator_graph.ainvoke(state)
                 state["user_input"] = ""
                 out = state.get("output", "")

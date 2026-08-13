@@ -100,7 +100,7 @@ async def execute_external(action: dict, context: dict) -> dict:
     """
     action_name = action.get("action_name", "")
     state = context.get("state") or {}
-    agent_id = state.get("_agent_id", "")
+    agent_id = context.get("agent_id") or state.get("_agent_id") or ""
     session_id = state.get("session_id", "default")
 
     sys.stderr.write(f"[External] 执行外部动作: {action_name}\n")

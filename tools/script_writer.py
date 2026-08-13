@@ -119,11 +119,15 @@ def _norm_field(name) -> str:
     - 小写
     - 去 t 前缀（tFreq/tBand/tStre/tlat/tlon 视为目标侧字段）
     - 去尾部数字索引（positionAnalysis 的 lat1/lat2/stre1 → lat/stre）
+    - 频率上下限并入基名 freq（minFreq/maxFreq/targetMinFreq → freq，与 tFreq 血缘一致）
     """
     n = str(name).strip().lower()
     if n.startswith("t") and len(n) > 1 and n[1:] in _TARGET_PREFIX_BASES:
         n = n[1:]
-    return re.sub(r"\d+$", "", n)
+    n = re.sub(r"\d+$", "", n)
+    if n.endswith("minfreq") or n.endswith("maxfreq"):
+        n = "freq"
+    return n
 
 
 def _tool_produced_fields(step: dict) -> set:
@@ -469,7 +473,7 @@ async def refresh_dependencies_with_llm(session_id: str, llm) -> bool:
         "3. 只能建立真实存在的数据依赖，禁止为了凑边而臆造。\n"
         "4. 若某消费字段的数据来自任务配置/外部系统而非任何步骤产出（如起飞点坐标、地图/盲区\n"
         "   文件、扫频目标频率与步进），则该字段输出空字符串。\n"
-        "5. 语义匹配示例：directionFinding 输入 freq ← signalAnalysis 输出 tFreq（目标频率）；\n"
+        "5. 语义匹配示例：directionFinding 输入 minFreq/maxFreq ← signalAnalysis 输出 tFreq（目标频率）；\n"
         "   positionAnalysis 输入 lat1/lon1 ← directionFinding 输出 lat/lon（测量点经纬度）。\n\n"
         "只输出 JSON 对象，key 为 consumer_step_id.field_name，value 为 producer_step_id 或空字符串：\n"
         '{"step_id.field": "producer_step_id"}'

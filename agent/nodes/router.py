@@ -74,7 +74,7 @@ def router_node(state: AgentState, deps: Deps = None) -> AgentState:
         state["_intent"] = "detail_planning"
         return state
 
-    # 首次进入：子agent 任务已由指挥分配，直接进入任务规划，不做 scene/calc 等意图分类
+    # 首次进入：子agent 任务已由指挥分配，直接进入任务规划
     if not state.get("plan_generated"):
         state["_intent"] = "planning"
         sys.stderr.write("[Router] subtask -> intent=planning\n"); sys.stderr.flush()

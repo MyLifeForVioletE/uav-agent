@@ -56,10 +56,15 @@
       "executor":"tool",
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\communication\\communication.exe",
       "input_schema":{
-        "oFreq":{
-          "type":"string",
-          "format":"range",
-          "description":"己方通信频率范围（如 1~2GHz）"
+        "oMinFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"己方通信最低频率（如 2GHz，执行时统一换算 MHz）"
+        },
+        "oMaxFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"己方通信最高频率（如 3GHz，执行时统一换算 MHz）"
         },
         "oBand":{
           "type":"string",
@@ -69,10 +74,15 @@
           "type":"object",
           "description":"传输数据大小"
         },
-        "tFreq":{
-          "type":"string",
-          "format":"range",
-          "description":"对方通信频率范围（如 1~2GHz）"
+        "tMinFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"对方通信最低频率（如 2GHz，执行时统一换算 MHz）"
+        },
+        "tMaxFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"对方通信最高频率（如 3GHz，执行时统一换算 MHz）"
         },
         "tBand":{
           "type":"string",
@@ -103,10 +113,15 @@
           "type":"object",
           "description":"通信保障位置纬度"
         },
-        "freq":{
-          "type":"string",
-          "format":"range",
-          "description":"通信频率范围（如 1~2GHz）"
+        "minFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"通信最低频率（如 2GHz，执行时统一换算 MHz）"
+        },
+        "maxFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"通信最高频率（如 3GHz，执行时统一换算 MHz）"
         },
         "band":{
           "type":"string",
@@ -141,10 +156,15 @@
       "executor":"tool",
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\direction_finding\\directionFinding.exe",
       "input_schema":{
-        "freq":{
-          "type":"string",
-          "format":"range",
-          "description":"目标频率范围（如 1~2GHz）"
+        "minFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"目标最低频率（如 2GHz，执行时统一换算 MHz）"
+        },
+        "maxFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"目标最高频率（如 3GHz，执行时统一换算 MHz）"
         },
         "band":{
           "type":"string",
@@ -179,10 +199,15 @@
       "executor":"tool",
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\jamming\\jamming.exe",
       "input_schema":{
-        "freq":{
-          "type":"string",
-          "format":"range",
-          "description":"目标频率范围（如 1~2GHz）"
+        "minFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"目标最低频率（如 2GHz，执行时统一换算 MHz）"
+        },
+        "maxFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"目标最高频率（如 3GHz，执行时统一换算 MHz）"
         },
         "power":{
           "type":"object",
@@ -270,10 +295,15 @@
       "executor":"tool",
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\recommend_comm_position\\recommendCommPosition.exe",
       "input_schema":{
-        "freq":{
-          "type":"string",
-          "format":"range",
-          "description":"通信频率范围（如 1~2GHz）"
+        "minFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"通信最低频率（如 2GHz，执行时统一换算 MHz）"
+        },
+        "maxFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"通信最高频率（如 3GHz，执行时统一换算 MHz）"
         },
         "blind":{
           "type":"file",
@@ -308,10 +338,15 @@
           "type":"object",
           "description":"目标纬度"
         },
-        "freq":{
-          "type":"string",
-          "format":"range",
-          "description":"目标频率范围（如 1~2GHz）"
+        "minFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"目标最低频率（如 2GHz，执行时统一换算 MHz）"
+        },
+        "maxFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"目标最高频率（如 3GHz，执行时统一换算 MHz）"
         },
         "band":{
           "type":"string",
@@ -350,10 +385,15 @@
           "type":"object",
           "description":"目标纬度"
         },
-        "freq":{
-          "type":"string",
-          "format":"range",
-          "description":"目标频率范围（如 1~2GHz）"
+        "minFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"目标最低频率（如 2GHz，执行时统一换算 MHz）"
+        },
+        "maxFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"目标最高频率（如 3GHz，执行时统一换算 MHz）"
         }
       },
       "output_schema":{
@@ -405,10 +445,15 @@
       "executor":"tool",
       "executable":"C:\\Users\\EHz\\Desktop\\agentSkills\\sweep_frequency_reconnaissance\\sweepFrequencyReconnaissance.exe",
       "input_schema":{
-        "target_frequency":{
-          "type":"string",
-          "format":"range",
-          "description":"目标频率范围（如 1~2GHz）"
+        "targetMinFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"目标最低频率（如 2GHz，执行时统一换算 MHz）"
+        },
+        "targetMaxFreq":{
+          "type":"number",
+          "format":"frequency",
+          "description":"目标最高频率（如 3GHz，执行时统一换算 MHz）"
         },
         "frequency_step":{
           "type":"number",

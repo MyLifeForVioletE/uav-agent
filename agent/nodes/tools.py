@@ -78,6 +78,7 @@ async def execute_tools(state: AgentState, deps: Deps) -> AgentState:
                 "messages": state["messages"],
                 "llm": deps.llm_no_tools,
                 "state": state,
+                "agent_id": state.get("_agent_id") or "_processor_",
             }
 
             # 分发执行
@@ -142,6 +143,7 @@ async def execute_tools(state: AgentState, deps: Deps) -> AgentState:
                 "messages": state["messages"],
                 "llm": deps.llm_no_tools,
                 "state": state,
+                "agent_id": state.get("_agent_id") or "_processor_",
             }
             try:
                 result = await dispatch_executor(action, context)

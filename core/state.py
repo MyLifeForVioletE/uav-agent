@@ -5,12 +5,11 @@ from typing import TypedDict
 class AgentState(TypedDict, total=False):
     """图状态的类型定义：贯穿所有节点的共享状态
     
-    使用 total=False 使所有字段可选，支持向后兼容：
-    - 单机模式：只填充原有字段
-    - 多机模式：额外填充协同字段
+    所有任务统一走多 agent 协同流程（指挥 agent + UAV/信息处理子 agent），
+    单机任务只是拆解出 1 个 UAV 子 agent 的特殊情况。
     """
     # ═══════════════════════════════════════════
-    #  原有字段（单机/多机通用）
+    #  基础字段（指挥/子 agent 通用）
     # ═══════════════════════════════════════════
     session_id: str           # 会话ID（用于Redis存储）
     messages: list            # 消息历史（HumanMessage / AIMessage / ToolMessage）
@@ -25,7 +24,7 @@ class AgentState(TypedDict, total=False):
     macro_phases: list          # 从宏观规划JSON解析出的阶段列表
     current_phase_idx: int      # 当前正在拆解的阶段索引（-1=未开始）
     detail_actions: list        # 逐阶段累积的原子动作列表
-    _skill_injected: set       # 已注入的 skill 名称集合（如 {"task_planning", "scene"}）
+    _skill_injected: set       # 已注入的 skill 名称集合（如 {"task_planning"}）
     current_step_idx: int     # 当前执行到的步骤索引
     output: str               # 当前轮的输出文本（LLM 回复或工具结果）
     pending_question: str     # 等待用户输入的提示语
@@ -36,11 +35,8 @@ class AgentState(TypedDict, total=False):
     _intent: str                   # router 节点暂存的意图分类结果
     
     # ═══════════════════════════════════════════
-    #  新增：多机协同字段（Coordinator 使用）
+    #  协同字段（Coordinator 使用）
     # ═══════════════════════════════════════════
-    # --- 协同模式标识 ---
-    collaboration_mode: str          # "single" | "multi" (默认 "single")
-    
     # --- Fleet 层级状态（仅 coordinator 使用）---
     fleet_id: str                    # 本次协同任务唯一ID
     uav_configs: list                # UAV配置列表 [{uav_id, uav_type, capabilities, ...}]
@@ -71,19 +67,21 @@ class AgentState(TypedDict, total=False):
     _dispatch_count: int              # dispatcher 调用计数（防死循环）
     _current_task_idx: int            # 当前正在执行的子任务索引（fleet_dispatcher 使用）
     _last_collected_input: str        # parameter_collector 记录的上次用户输入（防重复处理）
+    _decompose_failed: bool           # 任务分解失败标记：下一次"确认/重试"直接重试分解
     recorded_plans: dict              # 指挥记录的 UAV 宏观/详细规划 {agent_id: {...}}
     _awaiting_user_param: dict        # 指挥等待用户提供缺失参数的状态 {agent_id, task_id, params, correlation_id}
+    _awaiting_user_confirm: dict      # 指挥等待用户确认子agent规划方案的状态（多槽位，按 agent_id: {agent_id, task_id, task_name, correlation_id, plan_type, label, plan_text}）
     _param_resolve_attempts: dict     # 缺参推导尝试计数 {agent_key: int} 防循环
     _task_seq: int                    # 任务序号（会话内任务边界自增，用于轮换 task session_id）
 
-    # --- 单机图内部状态 ---
+    # --- 子 agent 执行图内部状态 ---
     _has_input: bool                  # idle 节点标记：本轮是否有新输入
     _last_input: str                  # idle 保存的原始用户输入（供 router 使用）
     _analyst_mode: bool               # 分析 agent 图标记：true 时工具调用走算法参数补齐管线
 
 
 def default_agent_state() -> AgentState:
-    """创建默认的单机模式状态（向后兼容）"""
+    """创建默认状态"""
     return {
         "session_id": "",
         "messages": [],
@@ -107,8 +105,7 @@ def default_agent_state() -> AgentState:
         "_tool_calls": None,
         "_last_response": None,
         "_intent": "",
-        # 多机字段默认值
-        "collaboration_mode": "single",
+        # 协同字段默认值
         "fleet_id": "",
         "uav_configs": [],
         "uav_count": 0,
@@ -128,6 +125,7 @@ def default_agent_state() -> AgentState:
         "_dispatch_count": 0,
         "_current_task_idx": 0,
         "_last_collected_input": "",
+        "_decompose_failed": False,
         "recorded_plans": {},
         "_awaiting_user_param": {},
         "_param_resolve_attempts": {},

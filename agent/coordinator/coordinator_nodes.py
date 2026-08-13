@@ -1,7 +1,7 @@
 """
 Coordinator 节点函数：
 1. coordinator_idle — 处理用户输入
-2. coordinator_router — 判断是协同任务还是单机任务
+2. coordinator_router — 统一进入协同流程
 3. parameter_collector — 收集用户参数，存入 Redis
 4. task_decomposer — LLM 拆分多机子任务
 5. task_allocator — 将子任务分配到具体 UAV
@@ -87,10 +87,10 @@ def coordinator_idle_node(state: AgentState, deps: Deps) -> AgentState:
 def coordinator_router_node(state: AgentState, deps: Deps) -> AgentState:
     """
     Coordinator 路由节点：
-    - 统一走协同流程（拆分配给 UAV 子 agent 执行）
+    - 所有任务统一走协同流程（拆分配给 UAV 子 agent 执行），
+      单机任务只是拆解出 1 个 UAV 子 agent 的特殊情况，无需在入口分流
     """
     uid = state.get("user_input", "")
-    state["collaboration_mode"] = "multi"
     if not state.get("original_scenario"):
         state["original_scenario"] = uid
     
@@ -112,9 +112,18 @@ def parameter_collector_node(state: AgentState, deps: Deps) -> AgentState:
     sys.stderr.flush()
     
     # 第一次进入或 pending_question 已清除：询问用户是否提供完信息
-    if not user_input or user_input == state.get("_last_collected_input", ""):
+    # 任务分解失败后（_decompose_failed）放行，允许用户用"确认/重试"重新进入分解
+    if (not user_input or user_input == state.get("_last_collected_input", "")) and not state.get("_decompose_failed"):
         state["pending_question"] = '请确认是否已提供所有必要信息？\n如有补充请输入，如已提供完请输入"确认"。'
         state["output"] = state["pending_question"]
+        return state
+    
+    # 任务分解失败后的显式重试：直接重新进入任务分解
+    if state.get("_decompose_failed") and user_input.strip() in ("重试", "重试分解", "再来一次", "retry"):
+        state["_last_collected_input"] = user_input
+        state["_decompose_failed"] = False
+        state["output"] = "[重试] 正在重新进行任务分解..."
+        state["pending_question"] = ""
         return state
     
     # 记录本次输入，避免重复处理
@@ -159,7 +168,8 @@ def parameter_collector_node(state: AgentState, deps: Deps) -> AgentState:
 6. **"位置X的坐标是XX"**：若 X 是目标自身位置，填入对应 target 的经纬度；若 X 是无人机前往的观测位置，填入对应无人机的 mission_position；两种情况同时成立则两处都填。多架无人机分别去多个位置时按顺序对应（如 UAV_1→位置1，UAV_2→位置2）
 7. 不要删除已有上下文中已有的条目和字段
 8. 输出完整的 JSON，包含所有需要保留的字段
-9. **模板允许的字段**：uavs 为 id/Longitude/Latitude/mission_position；targets 为 id/Longitude/Latitude/Frequency/frequency_step；base 为 Longitude/Latitude。**禁止输出模板中不存在的字段（如 position、x、y）**；坐标必须写成 Longitude 和 Latitude 两个字段，输出前检查一遍确保没有 position 字段
+9. **模板允许的字段**：uavs 为 id/Longitude/Latitude/mission_position；targets 为 id/Longitude/Latitude/minFreq/maxFreq/frequency_step；base 为 Longitude/Latitude。**禁止输出模板中不存在的字段（如 position、x、y）**；坐标必须写成 Longitude 和 Latitude 两个字段，输出前检查一遍确保没有 position 字段
+10. **频率范围拆分**：用户给出的频率范围（如"1GHz~2GHz""1到2GHz""1.2GHz 至 1.8GHz"）拆成两个字段——minFreq 填最低频率（如 "1GHz"）、maxFreq 填最高频率（如 "2GHz"），均保留原单位；用户只给出单个频率时 minFreq 和 maxFreq 都填该值。禁止输出 "1~2GHz" 这类范围字符串，禁止输出 Frequency 字段
 
 只输出 JSON 对象，不要输出其他内容。"""
     
@@ -226,6 +236,7 @@ def task_decomposer_node(state: AgentState, deps: Deps) -> AgentState:
     state["sub_tasks"] = []
     state["sub_task_assignments"] = {}
     state["uav_configs"] = []
+    state["_decompose_failed"] = False
     
     # 从 Redis context 获取实际的 UAV 数量和 target 数量
     context = {}
@@ -389,6 +400,8 @@ assigned_uav_role 必须与用户说的无人机类型一致。
             
             if not sub_tasks:
                 state["output"] = "[Coordinator] 任务分解失败：LLM返回的子任务列表为空"
+                state["_decompose_failed"] = True
+                state["pending_question"] = '任务分解失败。请回复"重试"重新分解，或输入"确认"再试一次。'
                 return state
             
             # 生成展示文本 - 详细的任务分解
@@ -416,6 +429,8 @@ assigned_uav_role 必须与用户说的无人机类型一致。
             print("[DEBUG] decomposer: output + pending_question SET", file=sys.stderr, flush=True)
         else:
             state["output"] = "[Coordinator] 任务分解失败，无法解析LLM输出"
+            state["_decompose_failed"] = True
+            state["pending_question"] = '任务分解失败。请回复"重试"重新分解，或输入"确认"再试一次。'
             print("[DEBUG] decomposer: else branch (no pending_question)", file=sys.stderr, flush=True)
             
     except Exception as e:
@@ -566,8 +581,11 @@ async def fleet_dispatcher_node(state: AgentState, deps: Deps) -> AgentState:
     
     # 如果子agent在等待用户确认，注入用户输入
     if state.get("_sub_awaiting") and state.get("user_input"):
+        # 用户回答规划确认问题 → 指挥回发 reply（user_confirm / user_reject）
+        if state.get("_awaiting_user_confirm"):
+            await fleet_mgr._handle_user_plan_confirm(state, state["user_input"])
         # 用户在回答指挥的缺参问题 → 指挥提取值并回发无人机，不注入子agent
-        if state.get("_awaiting_user_param"):
+        elif state.get("_awaiting_user_param"):
             await fleet_mgr._handle_user_param_answer(state, state["user_input"])
         else:
             task_id = state["_sub_awaiting"]
@@ -580,7 +598,12 @@ async def fleet_dispatcher_node(state: AgentState, deps: Deps) -> AgentState:
                     if agent:
                         agent.inject_user_input(state["user_input"])
                 state["_sub_awaiting"] = ""
-    
+
+    # 仍有排队待确认/回答的问题（如下一架无人机的方案）：立即返回给用户展示，
+    # 不推进 tick —— 否则长耗时的 run_step（如刚确认的 UAV 的详细规划）会把本轮问题吞掉
+    if state.get("_sub_awaiting"):
+        return state
+
     # 推进一步
     await fleet_mgr.tick(state)
     
@@ -696,6 +719,7 @@ def result_aggregator_node(state: AgentState, deps: Deps) -> AgentState:
     state["_current_task_idx"] = 0
     state["_last_collected_input"] = ""
     state["_awaiting_user_param"] = None
+    state["_awaiting_user_confirm"] = {}
     state["_fleet_manager"] = None
     state["recorded_plans"] = {}
     state["uav_count"] = 0
@@ -722,10 +746,11 @@ def result_aggregator_node(state: AgentState, deps: Deps) -> AgentState:
 
 def _repair_json(raw: str) -> str:
     """修复 LLM 生成的常见 JSON 格式错误，提高解析成功率"""
-    # 1. 修复双冒号 "key":: → "key": null,
-    raw = re.sub(r'":\s*:', '": null,', raw)
-    # 2. 修复缺失值的键 "key":\n"next_key" → "key": null,\n"next_key"
-    raw = re.sub(r'":\s*\n\s*"', '": null,\n"', raw)
+    # 1. 修复双冒号 "key":: → "key":（保留后随的值；若后随的是缺值的键则交给规则2补 null）
+    raw = re.sub(r'":\s*:', '":', raw)
+    # 2. 修复缺失值的键 "key":\n"next_key": ... → "key": null,\n"next_key": ...
+    #    仅当换行后跟的是一个"键"（引号串后还有冒号）才补 null，避免误伤合法的换行值
+    raw = re.sub(r'":\s*\n\s*"([^"\n]*)"\s*:', r'": null,\n"\g<1>":', raw)
     # 3. 修复 "key": } → "key": null }
     raw = re.sub(r'":\s*}', '": null }', raw)
     # 4. 修复 "key": , → "key": null,

@@ -3,7 +3,7 @@
         {"id": "", "Longitude": "", "Latitude": "", "mission_position": ""}
     ],
     "targets": [
-        {"id": "", "Longitude": "","Latitude":"","Frequency":"","frequency_step":""}
+        {"id": "", "Longitude": "","Latitude":"","minFreq":"","maxFreq":"","frequency_step":""}
     ],
     "base": {
         "Longitude": "","Latitude":""
