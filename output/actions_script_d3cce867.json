@@ -4,13 +4,13 @@
             "step_id": "UAV_1-1",
             "subject_id": "UAV_1",
             "step_type": "path_planning",
-            "step_name": "规划航线",
+            "step_name": "规划飞抵航线",
             "input": {
                 "startPositionLong": "70",
                 "startPositionLat": "15",
                 "destinationLong": "70",
                 "destinationLat": "15.01",
-                "map": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\clear.txt",
+                "map": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\LAYERDESCRIPTIONFILE.LDF",
                 "bilndArea": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\blind.txt",
                 "CoverageArea": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\clear.txt"
             },
@@ -83,7 +83,7 @@
             "step_id": "UAV_1-2",
             "subject_id": "UAV_1",
             "step_type": "flight",
-            "step_name": "沿航线飞行",
+            "step_name": "沿航线飞抵目标",
             "input": {
                 "waypoints": [
                     [
@@ -174,7 +174,7 @@
                 "startPositionLat": "15.01",
                 "destinationLong": "70",
                 "destinationLat": "15",
-                "map": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\clear.txt",
+                "map": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\LAYERDESCRIPTIONFILE.LDF",
                 "bilndArea": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\blind.txt",
                 "CoverageArea": "c:\\Users\\EHz\\Desktop\\uavAgentPlanning\\knowledge\\clear.txt"
             },

@@ -313,3 +313,129 @@ def planning_prep(state: AgentState, deps: Deps = None) -> AgentState:
             sys.stderr.write(f"[Planning] 所有 {len(phases)} 个阶段拆解完毕\n"); sys.stderr.flush()
 
     return state
+
+
+# ══════════════════════════════════════════════════════════════════
+#  contingency 生成 pass：完整详细规划生成后，统一生成异常应对措施
+#  （逐阶段规划时 LLM 无法引用尚未生成的后续阶段动作名，故必须基于完整列表生成）
+# ══════════════════════════════════════════════════════════════════
+
+def _build_contingency_prompt(actions: list) -> str:
+    """构造 contingency 生成 prompt：给出完整动作列表，要求按真实 action_name 引用"""
+    action_lines = "\n".join(
+        f"- action_id: {a.get('action_id', '')}, action_name: {a.get('action_name', '')}, "
+        f"tool_name: {a.get('tool_name', '')}, goal: {a.get('goal', '')}"
+        for a in actions
+    )
+    example = (
+        '{"contingencies": ['
+        '{"action_id": "a1", "contingency": ['
+        '{"condition": "在起点且任务失败", "action_name": "结束"},'
+        '{"condition": "任务取消且不在起点", "action_name": "规划返航航线"}]},'
+        '{"action_id": "a2", "contingency": ['
+        '{"condition": "目标位置变更", "action_name": "规划去程航线"},'
+        '{"condition": "航向偏移过大或遇障", "action_name": "规划去程航线"}]}'
+        "]}"
+    )
+    return (
+        "请为下面这架无人机的完整详细规划中的每个动作生成异常应对措施（contingency），"
+        "contingency 在异常发生时决定切换到哪个动作节点重新执行。\n\n"
+        f"【完整详细规划动作列表（action_name 必须严格按此列表引用）】\n{action_lines}\n\n"
+        "【输出格式】只输出 JSON：\n"
+        '{"contingencies": [{"action_id": "<动作id>", "contingency": [{"condition": "<异常情况>", "action_name": "<切换目标动作名>"}]}]}\n\n'
+        "【规则】\n"
+        "1. 只为可能出现异常的动作生成 contingency；无常见异常可省略该动作。\n"
+        "2. action_name 必须引用【完整详细规划动作列表】中已存在的 action_name，表示异常发生时切换到该动作重新执行。\n"
+        "3. 注意：action_name 字段填的是动作名称（如\"规划返航航线\"），**绝不能填 action_id**（如 action_1）；"
+        "action_id（如 action_1）只出现在每项的\"action_id\"键里，表示哪个动作的应对措施。\n"
+        "4. 也允许使用仅存在于状态机文件的系统/终端动作：\"结束\"（任务终止）、\"降落\"（落地）。\n"
+        "5. condition 要具体，如\"目标位置变更\"、\"航向偏移过大或遇障\"、\"规划失败\"、\"扫频失败但信息不足\"等。\n\n"
+        f"【参考示例】\n{example}"
+    )
+
+
+def _merge_contingency_results(actions: list, cons: list) -> int:
+    """把 LLM 返回的 contingencies 按 action_id 合并进动作列表；返回成功合并的动作数"""
+    by_id = {a.get("action_id", ""): a for a in actions}
+    merged = 0
+    for item in cons or []:
+        if not isinstance(item, dict):
+            continue
+        aid = item.get("action_id", "")
+        target = by_id.get(aid)
+        if not target:
+            continue
+        lst = item.get("contingency") or []
+        if not lst:
+            continue
+        target["contingency"] = lst
+        merged += 1
+    return merged
+
+
+def _run_contingency_pass(state: AgentState, deps: Deps = None) -> AgentState:
+    """完整详细规划生成后，基于全部动作列表统一生成每个动作的 contingency（只跑一次）。
+
+    LLM 调用失败/解析失败时静默降级（不生成 contingency），不影响规划主流程。
+    """
+    if state.get("_contingency_generated"):
+        return state
+    actions = state.get("detail_actions", [])
+    if not actions:
+        return state
+    import requests
+    prompt = _build_contingency_prompt(actions)
+    # 追加参考场景（phase_decmposition 场景文档中 contingency 的写法供参照）
+    if deps is not None:
+        try:
+            original = state.get("original_scenario") or ""
+            if original:
+                scenario_context, _ = deps.detail_planner.plan(original, retrieve_k=2, rerank_n=1)
+                if scenario_context:
+                    prompt += "\n\n【参考场景（异常应对写法参照此文档，但 action_name 仍须按上面动作列表引用）】\n" + scenario_context[:2000]
+        except Exception as e:
+            sys.stderr.write(f"[Planning] contingency RAG 参考检索失败: {e}\n"); sys.stderr.flush()
+    content = ""
+    try:
+        body = {
+            "model": MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "options": {"temperature": 0, "num_predict": 4096},
+        }
+        resp = requests.post(f"{OLLAMA_BASE}/api/chat", json=body, timeout=120)
+        resp.raise_for_status()
+        content = resp.json().get("message", {}).get("content", "")
+    except Exception as e:
+        sys.stderr.write(f"[Planning] contingency 生成调用失败: {e}\n"); sys.stderr.flush()
+        state["_contingency_generated"] = True
+        return state
+    data = _extract_json(content)
+    cons = (data.get("contingencies") if data else None) or []
+    if isinstance(cons, dict):
+        cons = list(cons.values()) if cons else []
+    # 统一覆盖：contingency 一律以本次（完整规划后）生成为准，
+    # 清掉逐阶段规划阶段 LLM 可能照抄参考文档误生成的旧值（旧值引用不到真实动作名）
+    for a in actions:
+        a.pop("contingency", None)
+    merged = _merge_contingency_results(actions, cons) if cons else 0
+    # 规范化每个 contingency 目标：解析为 (action_id, 真实 action_name)，
+    # 容错 LLM 把 action_id 误填进 action_name 字段（如 "action_4"）。
+    # 规范化后写入 detail_actions，确认展示与输出文件均使用一致的值。
+    from tools.script_writer import resolve_contingency_target
+    for a in actions:
+        lst = a.get("contingency") or []
+        if not lst:
+            continue
+        canon = []
+        for item in lst:
+            if not isinstance(item, dict):
+                continue
+            cond = item.get("condition", "")
+            tid, tname = resolve_contingency_target(actions, item.get("action_name", ""))
+            canon.append({"condition": cond, "action_id": tid, "action_name": tname})
+        a["contingency"] = canon
+    state["detail_actions"] = actions
+    state["_contingency_generated"] = True
+    sys.stderr.write(f"[Planning] contingency 生成完成: {merged}/{len(actions)} 个动作\n"); sys.stderr.flush()
+    return state

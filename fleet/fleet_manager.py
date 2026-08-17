@@ -577,6 +577,10 @@ class FleetManager:
         if plan_type == "detail_plan":
             for i, a in enumerate(plan_data, 1):
                 plan_text += f"{i}. {a.get('action_name', '')}\n"
+                for c in (a.get("contingency") or []):
+                    if not isinstance(c, dict):
+                        continue
+                    plan_text += f"   - 若{c.get('condition', '')} → 切换至「{c.get('action_name', '')}」\n"
         else:
             for p in plan_data:
                 plan_text += f"- {p.get('phase_name', p.get('phase_id', ''))}\n"

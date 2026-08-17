@@ -85,6 +85,7 @@ class AgentState(TypedDict, total=False):
     _inject_retry_action: dict | None    # 分析 agent：指挥回复后待重试注入的原子动作
     _user_param_giveup: dict         # 指挥：同一缺参向用户索要但多次未获值的计数 {agent:tool: int} 防死循环
     _skip_current_action: bool       # 子 agent：上一步动作因缺参无法解决被标记跳过（param_failed 置位）
+    _contingency_generated: bool     # 子 agent：完整详细规划后是否已统一生成 contingency（防重复生成）
 
 
 def default_agent_state() -> AgentState:
@@ -141,6 +142,7 @@ def default_agent_state() -> AgentState:
         "_last_input": "",
         "_user_param_giveup": {},
         "_skip_current_action": False,
+        "_contingency_generated": False,
     }
 
 

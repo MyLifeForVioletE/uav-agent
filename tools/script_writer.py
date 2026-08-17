@@ -221,6 +221,96 @@ def script_path(session_id: str) -> Path:
     return out_dir / f"actions_script_{session_id}.json"
 
 
+def contingency_plan_path(session_id: str) -> Path:
+    out_dir = BASE_DIR / "output"
+    return out_dir / f"contingency_plan_{session_id}.json"
+
+
+# 保留的异常应对目标动作（不在计划内、仅存在于状态机文件的系统/终端节点）：
+# 匹配不到计划内动作时，按动作名映射为固定 action_id 供下游状态机构建识别
+_RESERVED_CONTINGENCY_ACTIONS = {
+    "结束": "end",
+    "降落": "land",
+}
+
+
+def resolve_contingency_target(actions: list, raw: str) -> tuple:
+    """把 contingency 的目标引用解析为 (action_id, 规范化 action_name)。
+
+    容错顺序（LLM 可能把 action_id 误填进 action_name 字段）：
+    1. 精确匹配 action_name（填了真实动作名）
+    2. 精确匹配 action_id（填了 action_id，如 "action_4" → 反查该动作）
+    3. action_name 包含匹配
+    4. 保留系统/终端动作（结束→end、降落→land）
+    5. 无法解析 → ("", 原值)
+    """
+    raw = (raw or "").strip()
+    if raw:
+        for a in actions:
+            if (a.get("action_name") or "").strip() == raw:
+                return a.get("action_id", ""), (a.get("action_name") or "").strip()
+        for a in actions:
+            if (a.get("action_id") or "").strip() == raw:
+                return a.get("action_id", ""), (a.get("action_name") or "").strip()
+        for a in actions:
+            if raw in (a.get("action_name") or ""):
+                return a.get("action_id", ""), (a.get("action_name") or "").strip()
+        if raw in _RESERVED_CONTINGENCY_ACTIONS:
+            return _RESERVED_CONTINGENCY_ACTIONS[raw], raw
+    return "", raw
+
+
+def write_contingency_plan(session_id: str, actions: list):
+    """agent 详细规划动作全部执行完后，将每个动作的异常应对措施写入独立文件。
+
+    - 每个动作的 contingency（LLM 在完整详细规划后统一生成，按 action_name 引用同计划动作）
+      在此处与规划出的动作列表匹配，解析为 action_id（状态图节点间的条件转移边）；
+      匹配到计划内动作时 action_name 规范化为该动作的真实 action_name，保证与 action_id 一致。
+    - 文件：output/contingency_plan_{session_id}.json
+    """
+    plan = []
+    for step, a in enumerate(actions, 1):
+        if not isinstance(a, dict):
+            continue
+        contingency = a.get("contingency") or []
+        if not contingency:
+            continue
+        resolved = []
+        for item in contingency:
+            if not isinstance(item, dict):
+                continue
+            cond = item.get("condition", "")
+            raw = item.get("action_name", "")
+            tid, tname = resolve_contingency_target(actions, raw)
+            resolved.append({
+                "condition": cond,
+                "action_id": tid,
+                "action_name": tname,
+            })
+        plan.append({
+            "step": step,
+            "action_id": a.get("action_id", ""),
+            "action_name": a.get("action_name", ""),
+            "tool_name": a.get("tool_name", ""),
+            "goal": a.get("goal", ""),
+            "contingency": resolved,
+        })
+    if not plan:
+        sys.stderr.write("[ScriptWriter] 无 contingency 数据，跳过写入异常应对文件\n")
+        sys.stderr.flush()
+        return
+    try:
+        contingency_plan_path(session_id).write_text(
+            json.dumps({"plan": plan}, ensure_ascii=False, indent=4),
+            encoding="utf-8",
+        )
+        sys.stderr.write(f"[ScriptWriter] 已写入异常应对文件 contingency_plan_{session_id}.json（{len(plan)} 条）\n")
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"[ScriptWriter] contingency 文件写入失败: {e}\n")
+        sys.stderr.flush()
+
+
 # LLM 血缘映射去重缓存（进程内存，不落盘）：session_id → {"step_id.field": producer_step_id 或 None}
 _FIELD_MAP_CACHE: dict = {}
 

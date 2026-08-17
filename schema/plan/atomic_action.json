@@ -21,7 +21,8 @@
                     "tool_inputs":{"type":"object","description":"必须严格按该工具input_schema中定义的参数名提供，禁止自定义参数名","additionalProperties":{"type":"string"}},
                     "outputs":{"type":"array","items":{"type":"string"}},
                     "done_when":{"type":"string"},
-                    "failure_policy":{"type":["string","null"]}
+                    "failure_policy":{"type":["string","null"]},
+                    "contingency":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["condition","action_name"],"properties":{"condition":{"type":"string","description":"该动作执行过程中可能出现的异常情况描述。例如：目标位置变更、航向偏移过大或遇障、通信中断"},"action_name":{"type":"string","description":"异常发生时切换到的目标动作名称。通常引用本计划（本无人机详细动作列表）中已存在的动作 action_name（如\"规划去程航线\"），执行完成后系统会将该动作名与计划中动作的 action_id 匹配写入输出文件；也可以是仅存在于状态机文件的系统/终端动作：\"结束\"（任务终止，对应 action_id=end）、\"降落\"（落地，对应 action_id=land）"}}}}
                 }
             }
         }

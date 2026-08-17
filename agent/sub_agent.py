@@ -66,6 +66,8 @@ class SubAgent:
         self._pending_param_values: dict | None = None
         # 缺参待重试的原子动作（processor 模式：指挥回复后注入图重试执行）
         self._retry_action: dict | None = None
+        # 异常应对（contingency）文件是否已写（只写一次）
+        self._contingency_plan_written = False
 
     def _filter_deps(self, deps) -> Deps:
         """按 mode 过滤可用工具表，其余依赖（规划器/LLM）保持不变"""
@@ -370,6 +372,7 @@ class SubAgent:
         if idx >= len(actions):
             self.status = "done"
             self.progress = 1.0
+            self._write_contingency_plan_if_done()
             return
 
         action = dict(actions[idx])
@@ -456,8 +459,25 @@ class SubAgent:
         elif idx + 1 >= len(actions):
             self.status = "done"
             self.progress = 1.0
+            self._write_contingency_plan_if_done()
         else:
             self._sync_status()
+
+    def _write_contingency_plan_if_done(self):
+        """agent 全部动作执行完成后，将各动作的异常应对措施（contingency）写入独立文件。
+
+        只写一次：LLM 生成的 contingency 按 action_name 引用同计划动作，此处与规划出的
+        动作列表匹配解析为 action_id，输出到 output/contingency_plan_{session_id}.json。
+        """
+        if self._contingency_plan_written or self.status != "done":
+            return
+        try:
+            from tools.script_writer import write_contingency_plan
+            write_contingency_plan(self._session_id, self.state.get("detail_actions", []))
+            self._contingency_plan_written = True
+        except Exception as e:
+            sys.stderr.write(f"[SubAgent {self.agent_id}] contingency 文件写入失败: {e}\n")
+            sys.stderr.flush()
 
     async def _report_result_to_coordinator(self, action: dict, result: dict):
         """算法执行成功后将原始输出发给指挥 agent，由指挥 LLM 提取字段并写 Redis"""

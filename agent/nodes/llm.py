@@ -160,6 +160,9 @@ async def call_llm(state: AgentState, deps: Deps) -> AgentState:
         idx = state.get("current_phase_idx", 0)
         if phases and idx >= len(phases) - 1:
             state["detail_plan_done"] = True
+            # 完整详细规划生成后：基于全部动作列表统一生成各动作的异常应对措施（contingency）
+            from agent.nodes.planning import _run_contingency_pass
+            _run_contingency_pass(state, deps)
             # 整合输出全部阶段的原子动作
             all_actions = state.get("detail_actions", [])
             consolidated = {"actions": all_actions}
@@ -177,6 +180,10 @@ async def call_llm(state: AgentState, deps: Deps) -> AgentState:
         if actions:
             state["detail_actions"] = actions
             state["detail_plan_done"] = True
+            # 重规划替换了全部动作：重置标记并基于新计划重新生成 contingency
+            state["_contingency_generated"] = False
+            from agent.nodes.planning import _run_contingency_pass
+            _run_contingency_pass(state, deps)
             consolidated = json.dumps({"actions": data["actions"]}, ensure_ascii=False, indent=4)
             summary = f"已根据修改意见重新规划，共 {len(data['actions'])} 个原子动作：\n\n```json\n{consolidated}\n```\n\n请确认新的详细规划方案。"
             state["output"] = summary
