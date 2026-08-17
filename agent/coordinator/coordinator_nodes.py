@@ -758,6 +758,8 @@ def _repair_json(raw: str) -> str:
     # 5. 去掉尾随逗号
     raw = re.sub(r',\s*}', '}', raw)
     raw = re.sub(r',\s*]', ']', raw)
+    # 6. 修复冒号后的杂散标点（如 "key":. "value" → "key": "value"）
+    raw = re.sub(r'":\s*[.,;!](?=\s*["{\[\d])', '":', raw)
     return raw
 
 

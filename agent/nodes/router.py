@@ -69,6 +69,11 @@ def router_node(state: AgentState, deps: Deps = None) -> AgentState:
             state["_intent"] = "planning"
         return state
 
+    # 用户驳回详细规划 → 走 planning_prep 重规划路径（注入旧动作+修改意见）
+    if state.get("_replan_feedback") and state.get("macro_plan_confirmed"):
+        state["_intent"] = "planning"
+        return state
+
     # 宏观刚确认、详细规划尚未生成 → 去详细规划
     if state.get("macro_plan_confirmed") and not state.get("detail_plan_done"):
         state["_intent"] = "detail_planning"

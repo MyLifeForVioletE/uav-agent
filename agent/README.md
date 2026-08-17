@@ -12,7 +12,7 @@ LangGraph 图结构层：指挥 agent 图、子 agent 执行图与子 agent 实�
 | `sub_agent.py` | `SubAgent`：子 agent 实例，拥有独立状态与 Kafka 通信工具（send_message） |
 | `routes.py` | 执行图路由函数：按 `_intent` 状态分派到下游节点 |
 | `nodes/` | 执行图节点目录，每个节点一个文件 |
-| `executors/` | 原子动作执行器分发：tool / external / system |
+| `executors/` | 原子动作执行器分发：tool |
 
 ## Agent 角色
 

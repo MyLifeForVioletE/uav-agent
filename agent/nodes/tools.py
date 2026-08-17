@@ -24,9 +24,15 @@ def _append_analyst_script_line(state: AgentState, action: dict, result: dict):
 
 
 def _apply_post_action_update(state: AgentState, action: dict, result: dict):
-    """执行后根据 post_action_update 更新 Redis 上下文"""
+    """执行后根据 post_action_update 更新 Redis 上下文
+
+    post_action_update 在 schema/技能中定义为自然语言指令字符串（执行时由 tool_executor
+    确定性写 Redis），仅兼容遗留的 {key_path: param_name} dict 格式做旧式更新。
+    """
     post_action_update = action.get("post_action_update", {})
     if not post_action_update or result.get("error"):
+        return
+    if not isinstance(post_action_update, dict):
         return
     
     session_id = state.get("session_id", "")
@@ -151,6 +157,47 @@ async def execute_tools(state: AgentState, deps: Deps) -> AgentState:
                 result = {"success": False, "output": "", "error": f"分析工具执行异常: {e}"}
             if result.get("tool_inputs"):
                 action["tool_inputs"] = result["tool_inputs"]
+            # 缺参：挂起，由 SubAgent 上报指挥解析（跨 agent 依赖 / 推导 / 用户提供）
+            if result.get("missing_params"):
+                missing = "、".join(p.get("name", p) for p in result["missing_params"])
+                state["_analyst_param_pending"] = {"action": action, "missing": result["missing_params"]}
+                state["pending_question"] = ""
+                sys.stderr.write(f"[Execute] 分析缺参挂起: {missing}\n")
+                sys.stderr.flush()
+                state["_analyst_step"] = analyst_step
+                return state
+            # 自身工具能产出缺失字段 → 先执行产出动作，再执行本动作
+            if result.get("self_produce"):
+                guard = 0
+                while result.get("self_produce") and guard < 5:
+                    guard += 1
+                    producer = result["self_produce"].get("action") or result["self_produce"]
+                    try:
+                        presult = await dispatch_executor(producer, context)
+                    except Exception as e:
+                        presult = {"success": False, "output": "", "error": f"产出工具执行异常: {e}"}
+                    if presult.get("tool_inputs"):
+                        producer["tool_inputs"] = presult["tool_inputs"]
+                    if presult.get("missing_params"):
+                        missing = "、".join(p.get("name", p) for p in presult["missing_params"])
+                        state["_analyst_param_pending"] = {"action": action, "missing": presult["missing_params"]}
+                        state["pending_question"] = ""
+                        sys.stderr.write(f"[Execute] 产出工具缺参挂起: {missing}\n")
+                        sys.stderr.flush()
+                        state["_analyst_step"] = analyst_step
+                        return state
+                    _append_analyst_script_line(state, producer, presult)
+                    result = await dispatch_executor(action, context)
+                    if result.get("tool_inputs"):
+                        action["tool_inputs"] = result["tool_inputs"]
+                if result.get("missing_params"):
+                    missing = "、".join(p.get("name", p) for p in result["missing_params"])
+                    state["_analyst_param_pending"] = {"action": action, "missing": result["missing_params"]}
+                    state["pending_question"] = ""
+                    sys.stderr.write(f"[Execute] 产出后仍缺参挂起: {missing}\n")
+                    sys.stderr.flush()
+                    state["_analyst_step"] = analyst_step
+                    return state
             result_text = result.get("output", "") or result.get("error", "")
             state["output"] = result_text
             state["messages"].append(ToolMessage(content=result_text, tool_call_id=tc["id"]))

@@ -88,10 +88,12 @@ async def _call_algo(name: str, kwargs: dict):
     """非 exe 算法 mock 执行：返回与旧 MCP mock 相同的 content 格式（内嵌 JSON body）。"""
     algos = _load_algorithms()
     out_schema = algos.get(name, {}).get("output_schema", {})
-    output_files = ", ".join(out_schema.keys()) or "无"
+    # 有输出字段时 stdout 为 "输出;字段1, 字段2" 占位；无输出 schema（如 flight）则不给
+    # 伪造输出，stdout 为空字符串，脚本中该步骤 output 记录为空（""），不出现 "输出;无"。
+    output_files = ", ".join(out_schema.keys())
     body = {
         "returncode": 0,
-        "stdout": f"输出;{output_files}",
+        "stdout": f"输出;{output_files}" if output_files else "",
         "stderr": "",
     }
     return [{"type": "text", "text": json.dumps(body, ensure_ascii=False)}]

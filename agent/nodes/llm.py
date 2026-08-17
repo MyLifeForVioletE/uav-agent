@@ -19,47 +19,78 @@ async def call_llm(state: AgentState, deps: Deps) -> AgentState:
     state["user_input"] = None
     messages = state["messages"]
     o_messages = messages_to_ollama(messages)
+    macro_phase = ("task_planning" in (state.get("_skill_injected") or set()) and not state.get("plan_generated"))
+    detail_phase = (state.get("macro_plan_confirmed") and not state.get("detail_plan_done")
+                    and state.get("current_phase_idx", -1) >= 0)
     # 宏观/详细规划阶段禁止工具调用，强制 LLM 只输出文本/JSON
-    if ("task_planning" in (state.get("_skill_injected") or set()) and not state.get("plan_generated")) or \
+    if macro_phase or \
        (state.get("macro_plan_confirmed") and not state.get("detail_plan_done")) or \
        (state.get("detail_plan_done") and not state.get("detail_plan_confirmed")):
         o_tools = []
     else:
         o_tools = tools_to_ollama(deps.tools)
 
-    try:
-        body = {
-            "model": MODEL,
-            "messages": o_messages,
-            "stream": False,
-            "options": {"temperature": 0, "num_predict": 4096},
-        }
-        if o_tools:
-            body["tools"] = o_tools
-        resp = requests.post(
-            f"{OLLAMA_BASE}/api/chat",
-            json=body,
-            timeout=120,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        o_msg = data.get("message", {})
-        content = o_msg.get("content", "")
-        o_tcs = o_msg.get("tool_calls", [])
-    except Exception as e:
-        detail = ""
-        if hasattr(e, "response") and e.response is not None:
-            try:
-                detail = e.response.text[:500]
-            except Exception:
-                pass
-        aim = AIMessage(content=f"（调用 Ollama 失败：{e}\n{detail}）")
-        state["messages"].append(aim)
-        state["output"] = aim.content
-        state["_tool_calls"] = None
-        state["_last_response"] = aim
-        state["pending_question"] = aim.content
-        return state
+    # 宏观规划响应含 macro_phases 标记但 JSON 无效/被截断 → 重试（模型偶发中途截断，重试通常可恢复）
+    MAX_PLAN_ATTEMPTS = 3
+    attempt = 0
+    content = ""
+    o_tcs = []
+    while True:
+        attempt += 1
+        try:
+            body = {
+                "model": MODEL,
+                "messages": o_messages,
+                "stream": False,
+                "options": {"temperature": 0, "num_predict": 4096},
+            }
+            if o_tools:
+                body["tools"] = o_tools
+            resp = requests.post(
+                f"{OLLAMA_BASE}/api/chat",
+                json=body,
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            o_msg = data.get("message", {})
+            content = o_msg.get("content", "")
+            o_tcs = o_msg.get("tool_calls", [])
+        except Exception as e:
+            detail = ""
+            if hasattr(e, "response") and e.response is not None:
+                try:
+                    detail = e.response.text[:500]
+                except Exception:
+                    pass
+            aim = AIMessage(content=f"（调用 Ollama 失败：{e}\n{detail}）")
+            state["messages"].append(aim)
+            state["output"] = aim.content
+            state["_tool_calls"] = None
+            state["_last_response"] = aim
+            state["pending_question"] = aim.content
+            return state
+
+        if macro_phase:
+            _norm = content.replace('"stages"', '"macro_phases"').replace('"stage_id"', '"phase_id"').replace('"stage_name"', '"phase_name"')
+            has_marker = '"macro_phases"' in content or '"macro_phases"' in _norm
+            if has_marker:
+                parsed = _extract_json(_norm if '"macro_phases"' in _norm else content)
+                if parsed and (parsed.get("macro_phases") or parsed.get("stages")):
+                    break
+                if attempt < MAX_PLAN_ATTEMPTS:
+                    sys.stderr.write(f"[LLM] 宏观规划JSON无效或截断(第{attempt}次)，重试\n"); sys.stderr.flush()
+                    continue
+                sys.stderr.write(f"[LLM] 宏观规划JSON重试{MAX_PLAN_ATTEMPTS}次仍无效\n"); sys.stderr.flush()
+                break
+        elif detail_phase and "{" in content:
+            # 详细规划阶段：内容像 JSON 但解析失败（截断/格式错误）→ 重试，避免该阶段动作丢失
+            if _extract_json(content) is None:
+                if attempt < MAX_PLAN_ATTEMPTS:
+                    sys.stderr.write(f"[LLM] 详细规划JSON无效或截断(第{attempt}次)，重试\n"); sys.stderr.flush()
+                    continue
+                sys.stderr.write(f"[LLM] 详细规划JSON重试{MAX_PLAN_ATTEMPTS}次仍无效\n"); sys.stderr.flush()
+        break
 
     # 将 Ollama tool_calls 转为 LangChain 格式
     tool_calls = []
@@ -120,7 +151,7 @@ async def call_llm(state: AgentState, deps: Deps) -> AgentState:
     if state.get("macro_plan_confirmed") and not state.get("detail_plan_done") and state.get("current_phase_idx", -1) >= 0:
         data = _extract_json(content)
         if data:
-            actions = data.get("actions", [])
+            actions = data.get("actions") or data.get("atomic_actions") or []
             if actions:
                 state["detail_actions"] = state.get("detail_actions", []) + actions
                 sys.stderr.write(f"[LLM] 累积 {len(actions)} 个原子动作，总计 {len(state['detail_actions'])} 个\n"); sys.stderr.flush()
@@ -137,5 +168,24 @@ async def call_llm(state: AgentState, deps: Deps) -> AgentState:
             state["output"] = summary
             state["pending_question"] = summary
             sys.stderr.write(f"[LLM] 所有 {len(phases)} 个阶段拆解完毕，总计 {len(all_actions)} 个原子动作\n"); sys.stderr.flush()
+
+    # 用户修改意见后的单次重规划：解析新动作列表
+    if state.get("_replanning_detail"):
+        state["_replanning_detail"] = False
+        data = _extract_json(content)
+        actions = (data.get("actions") if data else None) or (data.get("atomic_actions") if data else None) or []
+        if actions:
+            state["detail_actions"] = actions
+            state["detail_plan_done"] = True
+            consolidated = json.dumps({"actions": data["actions"]}, ensure_ascii=False, indent=4)
+            summary = f"已根据修改意见重新规划，共 {len(data['actions'])} 个原子动作：\n\n```json\n{consolidated}\n```\n\n请确认新的详细规划方案。"
+            state["output"] = summary
+            state["pending_question"] = summary
+            sys.stderr.write(f"[LLM] 修改意见重规划完成，共 {len(data['actions'])} 个原子动作\n"); sys.stderr.flush()
+        else:
+            # 重规划失败：沿用原方案，避免挂起
+            sys.stderr.write("[LLM] 修改意见重规划响应未包含有效 actions，沿用原方案\n"); sys.stderr.flush()
+            state["detail_plan_done"] = True
+            state["pending_question"] = content or "重新规划未生成有效结果，请确认原方案或再次提出修改。"
 
     return state

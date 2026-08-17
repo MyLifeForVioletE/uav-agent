@@ -10,23 +10,107 @@ from core.config import OLLAMA_BASE, MODEL, BASE_DIR
 from core.state import AgentState, Deps
 
 
+def _repair_json(raw: str) -> str:
+    """修复 LLM 生成的常见 JSON 格式错误，提高解析成功率"""
+    # 1. 修复双冒号 "key":: → "key":（保留后随的值；若后随的是缺值的键则交给规则2补 null）
+    raw = re.sub(r'":\s*:', '":', raw)
+    # 2. 修复缺失值的键 "key":\n"next_key": ... → "key": null,\n"next_key": ...
+    #    仅当换行后跟的是一个"键"（引号串后还有冒号）才补 null，避免误伤合法的换行值
+    raw = re.sub(r'":\s*\n\s*"([^"\n]*)"\s*:', r'": null,\n"\g<1>":', raw)
+    # 3. 修复 "key": } → "key": null }
+    raw = re.sub(r'":\s*}', '": null }', raw)
+    # 4. 修复 "key": , → "key": null,
+    raw = re.sub(r'":\s*,', '": null,', raw)
+    # 5. 去掉尾随逗号
+    raw = re.sub(r',\s*}', '}', raw)
+    raw = re.sub(r',\s*]', ']', raw)
+    # 6. 修复冒号后的杂散标点（如 "key":. "value" → "key": "value"）
+    raw = re.sub(r'":\s*[.,;!](?=\s*["{\[\d])', '":', raw)
+    return raw
+
+
+def _close_json(text: str) -> str:
+    """将截断的 JSON 文本补全为合法 JSON（尽力而为）：
+    先应用常见错误修复，再补未闭合字符串、冒号后缺值、未闭合 { / ["""
+    s = text.rstrip()
+    s = s.rstrip("`").rstrip()
+    s = s.strip()
+    s = _repair_json(s)
+    stack = []
+    in_str = False
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_str:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            i += 1
+            continue
+        if ch == "{":
+            stack.append("o")
+            i += 1
+            continue
+        if ch == "[":
+            stack.append("a")
+            i += 1
+            continue
+        if ch == "}":
+            if stack and stack[-1] == "o":
+                stack.pop()
+            i += 1
+            continue
+        if ch == "]":
+            if stack and stack[-1] == "a":
+                stack.pop()
+            i += 1
+            continue
+        i += 1
+    if in_str:
+        s += '"'
+    s = s.rstrip().rstrip(",")
+    if s.endswith(":"):
+        s += " null"
+    s = s.rstrip().rstrip(",")
+    for c in reversed(stack):
+        s += "}" if c == "o" else "]"
+    return s
+
+
 def _extract_json(text: str) -> dict | None:
-    """从 LLM 输出中提取 JSON 对象（支持 markdown 代码块和裸 JSON）"""
+    """从 LLM 输出中提取 JSON 对象（支持 markdown 代码块/裸 JSON，带常见错误修复与截断闭合）"""
+    def _parse(blob: str) -> dict | None:
+        try:
+            return json.loads(blob)
+        except json.JSONDecodeError:
+            try:
+                return json.loads(_repair_json(blob))
+            except json.JSONDecodeError:
+                try:
+                    return json.loads(_close_json(blob))
+                except json.JSONDecodeError:
+                    return None
+
     # 尝试 ```json ... ``` 代码块
     m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
     if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
+        parsed = _parse(m.group(1))
+        if parsed is not None:
+            return parsed
     # 尝试裸 JSON：找第一个 { 到最后一个 }
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
-        try:
-            return json.loads(text[start:end + 1])
-        except json.JSONDecodeError:
-            pass
+        parsed = _parse(text[start:end + 1])
+        if parsed is not None:
+            return parsed
     return None
 
 
@@ -152,7 +236,9 @@ def planning_prep(state: AgentState, deps: Deps = None) -> AgentState:
             sys.stderr.write(f"[RAG] 约束检索异常: {e2}\n"); sys.stderr.flush()
 
         if scenario_context:
-            parts.append(f"【参考场景】\n{scenario_context}")
+            # qwen3-4b-agent 在长上下文中易截断宏观 JSON：只注入最高分参考场景（第一个参考块）
+            first_ref = scenario_context.split("[参考 2]", 1)[0].strip()
+            parts.append(f"【参考场景】\n{first_ref}")
         if constraint_context:
             parts.append(f"【约束条件】\n{constraint_context}")
 
@@ -161,6 +247,25 @@ def planning_prep(state: AgentState, deps: Deps = None) -> AgentState:
             state["user_input"] = f"{chr(10).join(parts)}\n\n---\n{uid}"
         else:
             sys.stderr.write(f"[RAG] 无内容可注入\n"); sys.stderr.flush()
+
+    # ── 用户驳回详细规划 → 基于现有动作+修改意见，单次重新规划 ──
+    elif state.get("_replan_feedback") and state.get("macro_plan_confirmed"):
+        feedback = state.get("_replan_feedback", "")
+        state["_replan_feedback"] = ""  # 置空而非 pop：LangGraph 合并不会删除缺失键
+        old_actions = state.get("detail_actions", [])
+        state["detail_plan_done"] = False
+        state["current_phase_idx"] = -1
+        state["_replanning_detail"] = True
+        parts = _load_detail_context(deps)
+        parts.append(f"【现有详细规划动作列表】\n{json.dumps(old_actions, ensure_ascii=False)}")
+        parts.append(f"【用户修改意见（重新规划时必须严格遵守）】\n{feedback}")
+        state["user_input"] = (
+            f"{chr(10).join(parts)}\n\n---\n"
+            f"请基于以上【现有详细规划动作列表】与【用户修改意见】，重新规划该任务的详细原子动作列表，"
+            f"不再拘泥于之前的宏观阶段划分。输出 JSON：{{\"actions\": [...]}}，"
+            f"必须严格遵守 atomic_action JSON Schema，字段名不可更改。"
+        )
+        sys.stderr.write(f"[Planning] 用户修改详细规划：旧动作 {len(old_actions)} 个，意见: {feedback}\n"); sys.stderr.flush()
 
     # ── 宏观规划已确认 → 解析阶段 + 注入第一阶段详细规划上下文 ──
     elif state.get("plan_generated") and not state.get("macro_plan_confirmed") and state.get("_intent") == "confirm":

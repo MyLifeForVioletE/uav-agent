@@ -64,6 +64,8 @@ class SubAgent:
         self._pending_resolution: dict | None = None
         # 指挥回复提供的参数值：{param_name: value}
         self._pending_param_values: dict | None = None
+        # 缺参待重试的原子动作（processor 模式：指挥回复后注入图重试执行）
+        self._retry_action: dict | None = None
 
     def _filter_deps(self, deps) -> Deps:
         """按 mode 过滤可用工具表，其余依赖（规划器/LLM）保持不变"""
@@ -280,6 +282,14 @@ class SubAgent:
             try:
                 self.state = await self.graph.ainvoke(self.state, {"recursion_limit": 50})
                 self.last_output = self.state.get("output", "")
+                # 缺参挂起：execute_tools 置 _analyst_param_pending，这里上报指挥并挂起等待
+                pending = self.state.get("_analyst_param_pending")
+                if pending and not self._awaiting_reply:
+                    action = pending.get("action", {})
+                    self._retry_action = action
+                    self.state["_analyst_param_pending"] = None
+                    await self._request_param_resolution(action, pending.get("missing", []))
+                    return
                 if self._awaiting_reply:
                     # 等待指挥回复期间不视为完成
                     self.status = "running"
@@ -344,6 +354,19 @@ class SubAgent:
             idx = 0
             self.state["current_step_idx"] = 0
 
+        # 上一步动作因缺参无法解决被标记跳过
+        if self.state.get("_skip_current_action"):
+            self.state["_skip_current_action"] = False
+            if 0 <= idx < len(actions):
+                actions[idx]["_failed"] = True
+                self.state["detail_actions"] = actions
+                sys.stderr.write(f"[SubAgent {self.agent_id}] 跳过动作: {actions[idx].get('action_name', '')}\n")
+                sys.stderr.flush()
+            self.state["current_step_idx"] = idx + 1
+            self.last_output = "参数无法解决，已跳过当前动作"
+            self.state["output"] = self.last_output
+            return
+
         if idx >= len(actions):
             self.status = "done"
             self.progress = 1.0
@@ -385,6 +408,22 @@ class SubAgent:
             self.status = "error"
             self.error = str(e)
             self.last_output = f"执行失败: {e}"
+            return
+
+        # 自身工具能产出缺失字段 → 先把产出动作插入当前步骤之前执行，再继续本动作
+        if result.get("self_produce"):
+            producer = result["self_produce"].get("action") or result["self_produce"]
+            actions = self.state.get("detail_actions", [])
+            idx = self.state.get("current_step_idx", 0)
+            if 0 <= idx <= len(actions):
+                actions.insert(idx, producer)
+                self.state["detail_actions"] = actions
+            self.last_output = f"已插入自身产出动作: {producer.get('action_name', '')}，先执行后再继续"
+            self.state["output"] = self.last_output
+            sys.stderr.write(
+                f"[SubAgent {self.agent_id}] 缺参自产：插入动作 {producer.get('action_name', '')} @ 步骤 {idx}\n"
+            )
+            sys.stderr.flush()
             return
 
         # 缺少参数 → 向指挥请求解决，暂停本步骤（不推进索引、不置错误）
@@ -600,6 +639,7 @@ class SubAgent:
             "step_idx": self.state.get("current_step_idx", 0),
             "missing_params": missing_params,
         }
+        self._retry_action = action
         self.state["pending_question"] = ""
         self.status = "running"
         self.last_output = f"缺少参数 {names}，已向指挥请求解决..."
@@ -641,7 +681,22 @@ class SubAgent:
                 if 0 <= idx < len(actions):
                     actions[idx]["tool_inputs"] = action.get("tool_inputs", {})
                 self._pending_resolution = None
+            # processor 模式：把待重试动作注入分析图，下一 tick 重新执行
+            if self.mode == "processor" and self._retry_action:
+                state = self.state
+                state["_inject_retry_action"] = self._retry_action
+                self._retry_action = None
+                sys.stderr.write(f"[SubAgent {self.agent_id}] 缺参已解决，注入重试动作，等待重试执行\n")
+                sys.stderr.flush()
             self.last_output = f"已收到指挥提供的参数值: {values}"
+            self.state["output"] = self.last_output
+        elif kind == "param_failed":
+            # 用户/指挥多次无法解决缺参：跳过当前动作，继续后续步骤
+            self._pending_resolution = None
+            self._retry_action = None
+            self.state["pending_question"] = ""
+            self.state["_skip_current_action"] = True
+            self.last_output = f"参数无法解决（{payload.get('params', [])}），已跳过当前动作。"
             self.state["output"] = self.last_output
             self.state["pending_question"] = ""
         elif kind == "user_confirm":
@@ -659,8 +714,22 @@ class SubAgent:
         elif kind == "user_reject":
             # 用户要求修改规划：把修改意见注入，重新规划
             self._plan_confirm_requested = None
+            self._reported_detail_plan = False
             feedback = payload.get("feedback", "") or content
             self.state["pending_question"] = ""
+            if (self.state.get("detail_plan_done")
+                    and not self.state.get("detail_plan_confirmed")):
+                # 驳回的是详细规划：重置 detail_plan_done 使 router 不再命中"待确认"分支，
+                # 保留 detail_actions 供 planning_prep 注入旧动作参考。
+                # planning_prep 检测 _replan_feedback 后走单次重规划路径，
+                # call_llm 中 _replanning_detail 块会用新动作完全替换 detail_actions。
+                self.state["_replan_feedback"] = feedback
+                self.state["detail_plan_done"] = False
+                self.state["current_phase_idx"] = -1
+            elif (self.state.get("plan_generated")
+                    and not self.state.get("macro_plan_confirmed")):
+                # 驳回的是宏观规划：重置 plan_generated，重新走宏观规划（feedback 随 user_input 注入）
+                self.state["plan_generated"] = False
             self.state["user_input"] = f"用户要求修改规划方案，请按以下意见重新规划：{feedback}"
             self.last_output = "用户要求修改规划，重新规划中..."
             self.state["output"] = self.last_output

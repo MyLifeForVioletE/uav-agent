@@ -85,6 +85,32 @@ def _load_capability_roles() -> dict[str, list[str]]:
 _CAP_ROLES = _load_capability_roles()
 
 
+def _load_output_producers() -> dict[str, list[str]]:
+    """字段名 → 能产出该字段的算法名列表（依据 algorithms.json 的 output_schema）"""
+    path = Path(BASE_DIR) / "algorithms.json"
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    result: dict[str, list[str]] = {}
+    for a in data.get("capabilities", []):
+        out = a.get("output_schema") or {}
+        for field in out:
+            result.setdefault(field, []).append(a["name"])
+    return result
+
+
+_OUTPUT_PRODUCERS = _load_output_producers()
+
+
+def producer_algos_for_field(field: str) -> list[str]:
+    """返回能产出该字段的算法名列表（用于缺参数据依赖解析）"""
+    return list(_OUTPUT_PRODUCERS.get(field, []))
+
+
 def filter_tools_for_role(tool_map: dict, role: str) -> dict:
     """按 agent 角色过滤工具表
 

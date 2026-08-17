@@ -78,6 +78,13 @@ class AgentState(TypedDict, total=False):
     _has_input: bool                  # idle 节点标记：本轮是否有新输入
     _last_input: str                  # idle 保存的原始用户输入（供 router 使用）
     _analyst_mode: bool               # 分析 agent 图标记：true 时工具调用走算法参数补齐管线
+    _replan_feedback: str             # 用户驳回详细规划时的修改意见（planning_prep 消费后清除）
+    _replanning_detail: bool          # 修改意见重规划进行中：call_llm 解析新动作列表
+    _pending_dependency: dict         # 指挥：动态依赖任务 task_id → 挂起的请求者信息 {requester, correlation_id, field, ...}
+    _analyst_param_pending: dict | None  # 分析 agent：缺参挂起 {action, missing}（等待指挥解析后重试）
+    _inject_retry_action: dict | None    # 分析 agent：指挥回复后待重试注入的原子动作
+    _user_param_giveup: dict         # 指挥：同一缺参向用户索要但多次未获值的计数 {agent:tool: int} 防死循环
+    _skip_current_action: bool       # 子 agent：上一步动作因缺参无法解决被标记跳过（param_failed 置位）
 
 
 def default_agent_state() -> AgentState:
@@ -132,6 +139,8 @@ def default_agent_state() -> AgentState:
         "_task_seq": 0,
         "_has_input": False,
         "_last_input": "",
+        "_user_param_giveup": {},
+        "_skip_current_action": False,
     }
 
 

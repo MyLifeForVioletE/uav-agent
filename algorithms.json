@@ -50,6 +50,22 @@
       "failure_policy":"执行失败根据失败信息思考原因并再次执行"
     },
     {
+      "name":"flight",
+      "roles":["uav"],
+      "description":"根据路径规划（path_planning）生成的航迹点沿航线飞行，模拟执行、不真实飞行。输入航迹点每个为(时间,经度,纬度,高度)四元组，如(0,70,15.01,0)",
+      "executor":"tool",
+      "input_schema":{
+        "waypoints":{
+          "type":"array",
+          "description":"路径规划输出的航迹点列表，每个航迹点为(时间,经度,纬度,高度)四元组，如(0,70,15.01,0)"
+        }
+      },
+      "output_schema":{
+      },
+      "done_when":"工具返回成功",
+      "failure_policy":"执行失败根据失败信息思考原因并再次执行"
+    },
+    {
       "name":"communication",
       "roles":["processor"],
       "description":"根据己方通信频率，己方带宽，传输数据大小，对方通信频率，对方带宽来得到通信成功与否标志与通信时长",

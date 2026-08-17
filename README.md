@@ -59,7 +59,7 @@ idle → router → [planning_prep / call_llm] → execute_tools → idle
 │   ├── graph.py             # 子 agent 执行图（6 节点）
 │   ├── analyst_graph.py     # 信息处理子 agent 图（3 节点）
 │   ├── nodes/               # 执行图节点
-│   └── executors/           # 原子动作执行器（tool / external / system）
+│   └── executors/           # 原子动作执行器（tool）
 ├── fleet/                   # 多机协同：FleetManager + TaskAllocator
 ├── tools/                   # 工具层：mcp_server.py + stub_tools.py + executor.py + script_writer.py
 ├── rag/                     # RAG 规划器：检索 + 重排
@@ -155,13 +155,13 @@ python main.py
 >>> 确认
 # 生成详细规划（原子动作列表），等待确认
 >>> 确认
-# 子 agent 依次执行原子动作（算法工具 / 外部系统 / 系统记录）
+# 子 agent 依次执行原子动作（算法工具）
 ```
 
 ## 执行器类型
 
+原子动作统一为 `tool` 执行器（调用算法工具）：
+
 | executor | 用途 |
 |----------|------|
-| `tool` | 调用算法工具（path_planning、signalAnalysis 等，`agent/executors/tool_executor.py`） |
-| `external` | 无人机系统执行（起飞、降落、飞行、载荷操作，`agent/executors/external_executor.py`） |
-| `system` | 系统内部记录（日志、状态保存、确认核验，`agent/executors/system_executor.py`） |
+| `tool` | 调用算法工具（path_planning、flight、signalAnalysis 等，`agent/executors/tool_executor.py`） |

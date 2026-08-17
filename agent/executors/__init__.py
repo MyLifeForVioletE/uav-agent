@@ -1,15 +1,13 @@
 """
 执行器分发模块：根据 executor 类型分发到对应的执行器
+
+原子动作统一为 tool 类型（调用算法工具）。
 """
 from .tool_executor import execute_tool_action
-from .external_executor import execute_external
-from .system_executor import execute_system
 
 # 执行器映射表
 EXECUTORS = {
     "tool": execute_tool_action,
-    "external": execute_external,
-    "system": execute_system,
 }
 
 

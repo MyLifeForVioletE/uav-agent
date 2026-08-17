@@ -16,6 +16,21 @@ def analyst_idle_node(state: AgentState, deps: Deps = None) -> AgentState:
     state["_tool_calls"] = None
     state["_last_response"] = None
 
+    # 缺参重试：指挥回复后注入待重试动作，直接走 execute_tools 重新执行
+    retry = state.get("_inject_retry_action")
+    if retry:
+        state["_inject_retry_action"] = None
+        state["_tool_calls"] = [{
+            "name": retry.get("tool_name", ""),
+            "args": retry.get("tool_inputs") or {},
+            "id": "call_retry_0",
+        }]
+        state["_last_response"] = {"content": "重试执行缺参动作"}
+        state["_has_input"] = True
+        state["output"] = ""
+        state["pending_question"] = ""
+        return state
+
     uid = state.get("user_input")
     uid = uid.strip() if uid else ""
     if not uid:
@@ -34,7 +49,9 @@ def analyst_idle_node(state: AgentState, deps: Deps = None) -> AgentState:
 
 
 def route_analyst_idle(state: AgentState) -> str:
-    """idle → 有输入则 call_llm，否则结束"""
+    """idle → 有输入则 call_llm；注入的重试工具调用则直接 execute_tools，否则结束"""
+    if state.get("_tool_calls"):
+        return "execute_tools"
     return "call_llm" if state.get("_has_input") else END
 
 
@@ -44,7 +61,9 @@ def route_analyst_call_llm(state: AgentState) -> str:
 
 
 def route_analyst_execute_tools(state: AgentState) -> str:
-    """execute_tools → 无待确认问题则回 call_llm 继续分析，否则结束"""
+    """execute_tools → 缺参挂起则结束（由 SubAgent 上报指挥）；无待确认问题则回 call_llm，否则结束"""
+    if state.get("_analyst_param_pending"):
+        return END
     return "call_llm" if not state.get("pending_question") else END
 
 
@@ -69,6 +88,7 @@ def build_analyst_graph(deps: Deps):
 
     builder.add_conditional_edges("idle", route_analyst_idle, {
         "call_llm": "call_llm",
+        "execute_tools": "execute_tools",
         END: END,
     })
     builder.add_conditional_edges("call_llm", route_analyst_call_llm, {

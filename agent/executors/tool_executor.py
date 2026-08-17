@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from core.config import BASE_DIR
+from core.ollama_utils import producer_algos_for_field
 from core.redis_manager import get_redis_manager
 
 
@@ -18,6 +19,10 @@ KNOWLEDGE_EXTENSIONS = {".txt", ".json", ".ldf"}
 
 # LLM 单次调用超时（秒）：Ollama 无响应/排队时兜底，避免永久挂起
 LLM_CALL_TIMEOUT = 60.0
+
+# 文件选择缓存：同一 session 内 knowledge 文件不变，避免重复调 LLM
+# key = (param_name, param_desc) → value = 文件路径
+_file_select_cache: dict[tuple, str] = {}
 
 
 async def _ainvoke_with_timeout(llm, prompt, timeout: float = LLM_CALL_TIMEOUT):
@@ -404,11 +409,21 @@ def _build_file_list_text(files: list[dict]) -> str:
 async def _llm_select_file(llm, files: list[dict], scene_description: str, 
                            param_name: str, param_desc: str) -> Optional[str]:
     """
-    调用 LLM 从文件列表中选择最合适的文件
+    调用 LLM 从文件列表中选择最合适的文件。
+    带 session 级缓存（knowledge 文件不变）和重试（Windows socket 瞬时耗尽恢复）。
     Returns: 选中的文件路径，或 None
     """
+    global _file_select_cache
     if not files or not llm:
         return None
+    
+    # 缓存命中：同一参数名+描述 → 同一文件（knowledge 目录不变）
+    cache_key = (param_name, param_desc)
+    if cache_key in _file_select_cache:
+        cached_path = _file_select_cache[cache_key]
+        sys.stderr.write(f"[ToolExecutor] LLM选择文件(缓存): {param_name}={cached_path}\n")
+        sys.stderr.flush()
+        return cached_path
     
     file_list_text = _build_file_list_text(files)
     
@@ -424,34 +439,63 @@ async def _llm_select_file(llm, files: list[dict], scene_description: str,
 
 请只输出选中的文件名（不包含路径），如果无法确定则输出 "NONE"。"""
 
-    try:
-        from langchain_core.messages import HumanMessage
-        response = await _ainvoke_with_timeout(llm, prompt)
-        selected = response.strip()
+    # 重试：Windows socket 瞬时耗尽（WSAENOBUFS）时短延迟后重试即可恢复
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            from langchain_core.messages import HumanMessage
+            response = await _ainvoke_with_timeout(llm, prompt)
+            selected = response.strip()
 
-        # 验证选择
-        if selected == "NONE" or not selected:
+            # 验证选择
+            if selected == "NONE" or not selected:
+                return None
+            
+            # 检查选中的文件是否在列表中
+            result_path = None
+            for f in files:
+                if f["name"] == selected:
+                    result_path = f["path"]
+                    break
+            
+            # 尝试模糊匹配
+            if result_path is None:
+                for f in files:
+                    if selected in f["name"] or f["name"] in selected:
+                        result_path = f["path"]
+                        break
+            
+            if result_path:
+                _file_select_cache[cache_key] = result_path
+            return result_path
+        except asyncio.TimeoutError:
+            sys.stderr.write(f"[ToolExecutor] LLM选择文件超时({LLM_CALL_TIMEOUT}s)，降级为无选定文件: {param_name}\n")
+            sys.stderr.flush()
             return None
-        
-        # 检查选中的文件是否在列表中
-        for f in files:
-            if f["name"] == selected:
-                return f["path"]
-        
-        # 尝试模糊匹配
-        for f in files:
-            if selected in f["name"] or f["name"] in selected:
-                return f["path"]
-        
-        return None
-    except asyncio.TimeoutError:
-        sys.stderr.write(f"[ToolExecutor] LLM选择文件超时({LLM_CALL_TIMEOUT}s)，降级为无选定文件: {param_name}\n")
-        sys.stderr.flush()
-        return None
-    except Exception as e:
-        sys.stderr.write(f"[ToolExecutor] LLM选择文件失败: {e}\n")
-        sys.stderr.flush()
-        return None
+        except OSError as e:
+            # Windows socket 耗尽 (WSAENOBUFS) 等瞬时网络错误：短延迟后重试
+            if attempt < max_retries - 1:
+                delay = 0.5 * (attempt + 1)
+                sys.stderr.write(f"[ToolExecutor] LLM选择文件网络错误(重试 {attempt+1}/{max_retries}): {e}\n")
+                sys.stderr.flush()
+                await asyncio.sleep(delay)
+                continue
+            sys.stderr.write(f"[ToolExecutor] LLM选择文件失败(已重试{max_retries}次): {e}\n")
+            sys.stderr.flush()
+            return None
+        except Exception as e:
+            err_str = str(e)
+            # 含 socket/buffer/bind 关键词的也视为瞬时错误，重试
+            is_transient = any(kw in err_str.lower() for kw in ("buffer", "socket", "bind", "eno", "connectionrefused", "reset"))
+            if is_transient and attempt < max_retries - 1:
+                delay = 0.5 * (attempt + 1)
+                sys.stderr.write(f"[ToolExecutor] LLM选择文件瞬时错误(重试 {attempt+1}/{max_retries}): {e}\n")
+                sys.stderr.flush()
+                await asyncio.sleep(delay)
+                continue
+            sys.stderr.write(f"[ToolExecutor] LLM选择文件失败: {e}\n")
+            sys.stderr.flush()
+            return None
 
 
 def _resolve_context_path(context: dict, path: str) -> Optional[str]:
@@ -535,34 +579,69 @@ async def _llm_extract_from_context(llm, param_name: str, param_desc: str,
 
 只输出一行路径或 "NONE"，不要输出其他任何内容。"""
 
-    try:
-        from langchain_core.messages import HumanMessage
-        response = await _ainvoke_with_timeout(llm, prompt)
-        path = response.strip().strip('"').strip("'")
-        
-        sys.stderr.write(f"[ToolExecutor] LLM键路径: '{path}'\n")
-        sys.stderr.flush()
-        
-        if not path or path.upper() == "NONE":
-            return None
-        
-        value = _resolve_context_path(context, path)
-        if value is None:
-            sys.stderr.write(f"[ToolExecutor] 路径未命中或值为空: '{path}'\n")
+    # 重试：Windows socket 瞬时耗尽时短延迟后重试
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            from langchain_core.messages import HumanMessage
+            response = await _ainvoke_with_timeout(llm, prompt)
+            path = response.strip().strip('"').strip("'")
+            
+            sys.stderr.write(f"[ToolExecutor] LLM键路径: '{path}'\n")
+            sys.stderr.flush()
+            
+            if not path or path.upper() == "NONE":
+                return None
+            
+            value = _resolve_context_path(context, path)
+            if value is None:
+                sys.stderr.write(f"[ToolExecutor] 路径未命中或值为空: '{path}'\n")
+                sys.stderr.flush()
+                return None
+            
+            sys.stderr.write(f"[ToolExecutor] 命中 {path} = {str(value)[:80]}\n")
+            sys.stderr.flush()
+            return value
+        except asyncio.TimeoutError:
+            sys.stderr.write(f"[ToolExecutor] LLM定位键超时({LLM_CALL_TIMEOUT}s): {param_name}\n")
             sys.stderr.flush()
             return None
-        
-        sys.stderr.write(f"[ToolExecutor] 命中 {path} = {str(value)[:80]}\n")
-        sys.stderr.flush()
-        return value
-    except asyncio.TimeoutError:
-        sys.stderr.write(f"[ToolExecutor] LLM定位键超时({LLM_CALL_TIMEOUT}s): {param_name}\n")
-        sys.stderr.flush()
-        return None
-    except Exception as e:
-        sys.stderr.write(f"[ToolExecutor] LLM定位键失败: {e}\n")
-        sys.stderr.flush()
-        return None
+        except (OSError, Exception) as e:
+            err_str = str(e)
+            is_transient = any(kw in err_str.lower() for kw in ("buffer", "socket", "bind", "eno", "connectionrefused", "reset"))
+            if is_transient and attempt < max_retries - 1:
+                delay = 0.5 * (attempt + 1)
+                sys.stderr.write(f"[ToolExecutor] LLM定位键瞬时错误(重试 {attempt+1}/{max_retries}): {e}\n")
+                sys.stderr.flush()
+                await asyncio.sleep(delay)
+                continue
+            sys.stderr.write(f"[ToolExecutor] LLM定位键失败: {e}\n")
+            sys.stderr.flush()
+            return None
+
+
+def _build_producer_action(algo_name: str, field: str) -> dict:
+    """构造产出缺失字段的原子动作（参数留空，由执行器从上下文解析）"""
+    return {
+        "executor": "tool",
+        "tool_name": algo_name,
+        "tool_inputs": {},
+        "action_name": f"{algo_name} 产出 {field}",
+        "goal": f"调用算法 {algo_name} 产出缺失参数 {field}，供后续动作使用",
+    }
+
+
+def _find_self_producer(tools_map: dict, truly_missing: list, current_tool: str) -> dict | None:
+    """在自身工具集中查找能产出缺失字段的算法。
+
+    Returns: {"field": 字段名, "action": 产出动作} 或 None
+    """
+    for field in truly_missing:
+        for aname in producer_algos_for_field(field):
+            if aname == current_tool or aname not in tools_map:
+                continue
+            return {"field": field, "action": _build_producer_action(aname, field)}
+    return None
 
 
 def _param_placeholder_names(context: dict, tool_inputs: dict) -> set:
@@ -587,6 +666,23 @@ def _param_placeholder_names(context: dict, tool_inputs: dict) -> set:
             for k in pnames:
                 if k in item and not str(item[k] or "").strip():
                     matched.add(k)
+    return matched
+
+
+def _placeholder_fields_in_context(context: dict, fields: list) -> set:
+    """在结构化上下文中已存在且值为空的字段集合。
+
+    用于缺参检查：上游非 exe 算法已执行并写入空占位（如扫频侦察的 sweepData=''），
+    即使当前 tool_inputs 未携带该参数键，也应视为占位字段而非真正缺失。
+    """
+    matched = set()
+    for f in fields:
+        for group in context.values():
+            if not isinstance(group, list):
+                group = [group]
+            for item in group:
+                if isinstance(item, dict) and f in item and not str(item[f] or "").strip():
+                    matched.add(f)
     return matched
 
 
@@ -710,6 +806,66 @@ def _write_path_to_redis(redis_mgr, session_id: str, agent_id: str, tool_inputs:
         sys.stderr.flush()
 
 
+def _resolve_flight_waypoints(redis_mgr, session_id: str, agent_id: str) -> list:
+    """flight 工具输入解析：取该无人机最近一次 path_planning 输出的航迹点。
+
+    Redis 中 uavs.<id>.path.waypoints 存储为 {Longitude, Latitude, Altitude, Time} 字典，
+    转为 (时间,经度,纬度,高度) 四元组列表；无可用航迹点时返回空列表。
+    """
+    if not redis_mgr or not agent_id:
+        return []
+    try:
+        ctx = redis_mgr.get_context(session_id) or {}
+        uavs = ctx.get("uavs")
+        if isinstance(uavs, list):
+            for u in uavs:
+                if isinstance(u, dict) and u.get("id") == agent_id:
+                    p = u.get("path")
+                    if isinstance(p, dict) and isinstance(p.get("waypoints"), list):
+                        return [
+                            [w.get("Time", 0), w.get("Longitude"), w.get("Latitude"), w.get("Altitude", 0)]
+                            for w in p["waypoints"] if isinstance(w, dict)
+                        ]
+                    break
+    except Exception as e:
+        sys.stderr.write(f"[ToolExecutor] flight 航迹解析失败: {e}\n")
+        sys.stderr.flush()
+    return []
+
+
+def _simulate_flight_redis(redis_mgr, session_id: str, agent_id: str, waypoints: list):
+    """flight 工具模拟执行：把无人机当前位置更新为航线终点（写回 Redis 上下文）"""
+    if not waypoints or not agent_id or not redis_mgr:
+        return
+    try:
+        last = waypoints[-1]
+        if isinstance(last, (list, tuple)) and len(last) >= 3:
+            lon, lat = last[1], last[2]
+        elif isinstance(last, dict):
+            lon = last.get("Longitude") if last.get("Longitude") is not None else last.get("x")
+            lat = last.get("Latitude") if last.get("Latitude") is not None else last.get("y")
+        else:
+            return
+        if lon is None or lat is None:
+            return
+        ctx = redis_mgr.get_context(session_id) or {}
+        uavs = ctx.get("uavs")
+        if not isinstance(uavs, list):
+            uavs = []
+            ctx["uavs"] = uavs
+        for u in uavs:
+            if isinstance(u, dict) and u.get("id") == agent_id:
+                u["Longitude"] = str(lon)
+                u["Latitude"] = str(lat)
+                break
+        redis_mgr.save_context(session_id, ctx)
+        sys.stderr.write(f"[ToolExecutor] flight 模拟飞行完成，{agent_id} 位置更新为 [{lon},{lat}]\n")
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"[ToolExecutor] flight 位置更新失败: {e}\n")
+        sys.stderr.flush()
+
+
 async def execute_tool_action(action: dict, context: dict) -> dict:
     """
     执行工具类原子动作
@@ -731,6 +887,8 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
 
     # 是否需真实调用 exe：只有路径规划算法调用，其余算法模拟执行
     real_exec = tool_name == "path_planning"
+    # flight 工具：输入航迹点直接取 Redis（path_planning 输出），成功后模拟飞行更新位置
+    is_flight = tool_name == "flight"
 
     # 查找匹配的工具
     tool = tools.get(tool_name)
@@ -788,13 +946,22 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
 
     # 空占位保护：上下文中已存在且值为空的参数字段（如未执行 exe 的扫频侦察建立的
     # sweepData 占位），不允许被 LLM 用无关上下文数据（航迹点等）填充，保持"只留参数名"。
-    if not real_exec:
+    if not real_exec and not is_flight:
         ctx_for_placeholder = redis_mgr.get_context(session_id)
         placeholder_params = _param_placeholder_names(ctx_for_placeholder, tool_inputs)
         if placeholder_params:
             for p in placeholder_params:
                 tool_inputs[p] = p  # 只留参数名
             sys.stderr.write(f"[ToolExecutor] 空占位保护: {tool_name} 参数 {sorted(placeholder_params)} 保持为参数名占位\n")
+            sys.stderr.flush()
+
+    # flight 特殊处理：航迹点不依赖 LLM 猜测，直接取该无人机最近一次 path_planning 输出
+    # （写入 uavs.<id>.path.waypoints），转为 (时间,经度,纬度,高度) 四元组列表。
+    if is_flight:
+        wp = _resolve_flight_waypoints(redis_mgr, session_id, agent_id)
+        if wp:
+            tool_inputs["waypoints"] = wp
+            sys.stderr.write(f"[ToolExecutor] flight 已取 Redis 航迹点 {len(wp)} 个\n")
             sys.stderr.flush()
 
     for param_name in required_params:
@@ -805,8 +972,8 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
         # 非 exe 算法：LLM 猜测的值不可信（可能是参数描述/编造文本），
         # 统一清空后走 Redis 查找，保证值一定来自上下文原文。
         if param_value and str(param_value).strip():
-            if real_exec:
-                continue  # 真实 exe：已有值直接用
+            if real_exec or is_flight:
+                continue  # 真实 exe / flight：已有值直接用
             sys.stderr.write(f"[ToolExecutor] 非exe 清除 LLM 猜测值: {param_name}={param_value}\n")
             sys.stderr.flush()
             tool_inputs[param_name] = ""
@@ -907,33 +1074,77 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
     # 检查必需参数是否齐全
     if input_schema:
         missing = [p for p in input_schema if not str(tool_inputs.get(p, "")).strip()]
-        if missing and not real_exec:
-            # 非真实执行的算法：缺参时用参数名填充，保证能记录到脚本与 Redis 输出占位
-            sys.stderr.write(f"[ToolExecutor] {tool_name} 非 exe 执行，缺参用参数名填充: {missing}\n")
-            sys.stderr.flush()
-            for p in missing:
-                tool_inputs[p] = p
-            missing = []
         if missing:
-            names = "、".join(f"{p}({input_schema[p].get('description', p)})" for p in missing)
-            sys.stderr.write(f"[ToolExecutor] 缺少必需参数: {names}\n")
-            sys.stderr.flush()
-            missing_params = [
-                {
-                    "name": p,
-                    "description": input_schema[p].get("description", p),
-                    "type": input_schema[p].get("type", "string"),
+            # 区分「占位字段」（上游已产出但值仍为空）与「真正缺失」（完全不存在）：
+            # 占位字段保持原行为；真正缺失走数据依赖解析（自身产出工具 → 指挥跨 agent 解析）
+            placeholder_fields = _placeholder_fields_in_context(context, missing)
+            truly_missing = [p for p in missing if p not in placeholder_fields]
+            if truly_missing:
+                missing_params = [
+                    {
+                        "name": p,
+                        "description": input_schema[p].get("description", p),
+                        "type": input_schema[p].get("type", "string"),
+                    }
+                    for p in truly_missing
+                ]
+                # 自身工具集能产出缺失字段 → 先执行产出工具，再继续本动作
+                # 注意：context 已被下方参数解析重绑定为 Redis 结构化上下文，须用 tools 变量（执行上下文传入的工具表）
+                producer = _find_self_producer(tools, truly_missing, tool_name)
+                if producer:
+                    sys.stderr.write(
+                        f"[ToolExecutor] {tool_name} 真正缺参 {truly_missing}，"
+                        f"自身工具 {producer['action']['tool_name']} 可产出 {producer['field']}，先执行产出动作\n"
+                    )
+                    sys.stderr.flush()
+                    return {
+                        "success": False,
+                        "output": "",
+                        "error": f"缺少参数 {truly_missing}，先执行产出工具 {producer['action']['tool_name']}",
+                        "missing_params": missing_params,
+                        "self_produce": producer,
+                        "tool_inputs": tool_inputs,
+                        "pending": False,
+                    }
+                # 自身无法产出 → 上报指挥跨 agent 解析（exe 与非 exe 一致，不再静默占位）
+                names = "、".join(f"{p}({input_schema[p].get('description', p)})" for p in truly_missing)
+                sys.stderr.write(f"[ToolExecutor] {tool_name} 真正缺参: {names}，自身无产出工具，上报指挥解析\n")
+                sys.stderr.flush()
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": f"缺少必需参数: {names}",
+                    "missing_params": missing_params,
+                    "tool_inputs": tool_inputs,
+                    "pending": False,
                 }
-                for p in missing
-            ]
-            return {
-                "success": False,
-                "output": "",
-                "error": f"缺少必需参数: {names}",
-                "missing_params": missing_params,
-                "tool_inputs": tool_inputs,
-                "pending": False,
-            }
+            # 仅占位字段：非真实执行算法用参数名填充，保证能记录到脚本与 Redis 输出占位
+            if missing and not real_exec:
+                sys.stderr.write(f"[ToolExecutor] {tool_name} 非 exe 执行，缺参用参数名填充: {missing}\n")
+                sys.stderr.flush()
+                for p in missing:
+                    tool_inputs[p] = p
+                missing = []
+            if missing:
+                names = "、".join(f"{p}({input_schema[p].get('description', p)})" for p in missing)
+                sys.stderr.write(f"[ToolExecutor] 缺少必需参数: {names}\n")
+                sys.stderr.flush()
+                missing_params = [
+                    {
+                        "name": p,
+                        "description": input_schema[p].get("description", p),
+                        "type": input_schema[p].get("type", "string"),
+                    }
+                    for p in missing
+                ]
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": f"缺少必需参数: {names}",
+                    "missing_params": missing_params,
+                    "tool_inputs": tool_inputs,
+                    "pending": False,
+                }
 
     # 所有参数就绪，执行工具
     # 无论是否真实调用 exe，都根据该算法的输出 schema 在 Redis 中建立输出占位字段（值暂为空）
@@ -967,23 +1178,25 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
             pass
 
         import re as _re
+        body_parsed = False  # 是否成功解析出内嵌 JSON body（stdout 为空也视为解析成功）
         try:
             if inner_text:
                 parsed = json.loads(inner_text)
                 if isinstance(parsed, dict):
+                    body_parsed = True
                     if parsed.get("returncode") is not None:
                         returncode = parsed.get("returncode")
-                    out = parsed.get("stdout", "")
-                    if out:
+                    if "stdout" in parsed:
+                        out = parsed.get("stdout", "")
                         readable = out if isinstance(out, str) else str(out)
-            if not readable:
+            if not readable and not body_parsed:
                 # 兜底：从原始文本中正则提取 "stdout": "xxx"
                 m = _re.search(r'"stdout"\s*:\s*"((?:[^"\\]|\\.)*)"', inner_text or result_text)
                 if m:
                     readable = m.group(1).encode().decode("unicode_escape", errors="ignore")
         except Exception:
-            pass
-        if not readable:
+            body_parsed = False
+        if not readable and not body_parsed:
             readable = result_text
 
         # 将算法返回结果追加到消息历史，让 LLM 后续能看到算法输出
@@ -1005,6 +1218,10 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
         # 路径规划成功：把航迹点写入 Redis（关联无人机 + 起终点），并同步到脚本输出
         if real_exec and tool_name == "path_planning":
             _write_path_to_redis(redis_mgr, session_id, agent_id, tool_inputs, readable)
+
+        # flight 成功：模拟沿航迹飞行，把无人机当前位置更新为航线终点
+        if is_flight:
+            _simulate_flight_redis(redis_mgr, session_id, agent_id, tool_inputs.get("waypoints") or [])
 
         return {
             "success": True,

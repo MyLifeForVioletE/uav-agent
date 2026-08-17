@@ -116,43 +116,48 @@ class FleetManager:
     # ── 指挥 agent 收件箱：处理子 agent 的上报/请示/结果 ─────────────
 
     async def _process_coordinator_inbox(self, state: AgentState):
-        """拉取指挥收件箱：report/result 程序化归档；request 交给指挥 LLM 决策回复"""
+        """拉取指挥收件箱：report/result 程序化归档；request 交给指挥 LLM 决策回复。
+
+        持续拉取直到本轮无新消息（上限 5 轮），确保同一时刻投递的多条消息全部消费，
+        避免某次 poll 只取到部分消息、余下消息等下一 tick 时被完成路径/会话切换抢先。
+        """
         if not self._bus:
             return
-        try:
-            msgs = await self._bus.poll(self._COORD_ID, timeout=0.1)
-        except Exception as e:
-            sys.stderr.write(f"[Fleet] 指挥收件箱拉取失败: {e}\n")
-            sys.stderr.flush()
-            return
-        if not msgs:
-            return
+        for _ in range(5):
+            try:
+                msgs = await self._bus.poll(self._COORD_ID, timeout=0.1)
+            except Exception as e:
+                sys.stderr.write(f"[Fleet] 指挥收件箱拉取失败: {e}\n")
+                sys.stderr.flush()
+                return
+            if not msgs:
+                break
 
-        session_id = state.get("session_id", "default")
-        mailbox = state.setdefault("coordinator_mailbox", [])
-        for m in msgs:
-            mtype = m.get("msg_type", "")
-            from_id = m.get("from", "")
-            content = m.get("content", "")
-            # 只处理本会话的消息；非本会话的视为残留，直接消费丢弃
-            if m.get("payload", {}).get("session_id") != session_id:
-                sys.stderr.write(f"[Fleet] 丢弃非本会话消息({mtype} from {from_id}): {content[:60]}\n")
-                sys.stderr.flush()
-                continue
-            mailbox.append(m)
-            if mtype == "result":
-                sys.stderr.write(f"[Fleet] 指挥收到 {from_id} 结果: {content[:120]}\n")
-                sys.stderr.flush()
-                await self._handle_agent_result(state, m)
-            elif mtype in ("report",):
-                await self._archive_report(state, m)
-                await self._record_plan_report(state, m)
-                sys.stderr.write(f"[Fleet] 指挥收到 {from_id} 上报({mtype}): {content[:120]}\n")
-                sys.stderr.flush()
-            elif mtype == "request":
-                sys.stderr.write(f"[Fleet] 指挥收到 {from_id} 请示: {content[:120]}\n")
-                sys.stderr.flush()
-                await self._handle_coordinator_request(state, m)
+            session_id = state.get("session_id", "default")
+            mailbox = state.setdefault("coordinator_mailbox", [])
+            for m in msgs:
+                mtype = m.get("msg_type", "")
+                from_id = m.get("from", "")
+                content = m.get("content", "")
+                # 只处理本会话的消息；非本会话的视为残留，直接消费丢弃
+                if m.get("payload", {}).get("session_id") != session_id:
+                    sys.stderr.write(f"[Fleet] 丢弃非本会话消息({mtype} from {from_id}): {content[:60]}\n")
+                    sys.stderr.flush()
+                    continue
+                mailbox.append(m)
+                if mtype == "result":
+                    sys.stderr.write(f"[Fleet] 指挥收到 {from_id} 结果: {content[:120]}\n")
+                    sys.stderr.flush()
+                    await self._handle_agent_result(state, m)
+                elif mtype in ("report",):
+                    await self._archive_report(state, m)
+                    await self._record_plan_report(state, m)
+                    sys.stderr.write(f"[Fleet] 指挥收到 {from_id} 上报({mtype}): {content[:120]}\n")
+                    sys.stderr.flush()
+                elif mtype == "request":
+                    sys.stderr.write(f"[Fleet] 指挥收到 {from_id} 请示: {content[:120]}\n")
+                    sys.stderr.flush()
+                    await self._handle_coordinator_request(state, m)
 
     async def _archive_report(self, state: AgentState, msg: dict):
         """子 agent 上报/结果归档：结果写入 shared_results，payload 中的上下文更新写入 Redis"""
@@ -257,6 +262,13 @@ class FleetManager:
             await self._send_reply(state, from_id, "缺参信息为空，请重试。", correlation_id)
             return
 
+        # 跨 agent 数据依赖：其他 agent 的工具能产出缺失字段 → 派发动态子任务并挂起请求者
+        dispatched = await self._try_dispatch_dependency_producer(
+            state, msg, missing, from_id, correlation_id, session_id
+        )
+        if dispatched:
+            return
+
         # 防循环：同一 agent+动作 的推导尝试上限
         attempts_key = f"{from_id}:{tool_name}:{payload.get('action_name', '')}"
         attempts = state.setdefault("_param_resolve_attempts", {})
@@ -315,6 +327,77 @@ class FleetManager:
         state["output"] = question
         sys.stderr.write(f"[Fleet] 缺参推导失败/超限，询问用户: {question[:120]}\n")
         sys.stderr.flush()
+
+    async def _try_dispatch_dependency_producer(self, state: AgentState, msg: dict,
+                                                missing: list, from_id: str,
+                                                correlation_id: str, session_id: str) -> bool:
+        """跨 agent 数据依赖解析：若其他 agent 的工具能产出缺失字段，派发动态子任务并挂起请求者。
+
+        返回 True 表示已派发动态子任务（请求者等待任务完成后由 _tick_agent 回复重试）。
+        """
+        if not self.deps:
+            return False
+        from core.ollama_utils import producer_algos_for_field
+
+        # 找出能产出缺失字段的算法，且执行该算法的 agent 不是请求者自身
+        target = None
+        for p in missing:
+            field = p.get("name", "") if isinstance(p, dict) else p
+            if not field:
+                continue
+            for aname in producer_algos_for_field(field):
+                agents = list(self.sub_agents.items()) + [(self._PROCESSOR_ID, self._processor_agent)]
+                for agent_id, agent in agents:
+                    if agent_id == from_id or agent is None:
+                        continue
+                    if aname in agent.deps.tools:
+                        target = {"agent": agent, "field": field, "algo": aname}
+                        break
+                if target:
+                    break
+            if target:
+                break
+        if not target:
+            return False
+
+        agent = target["agent"]
+        algo, field = target["algo"], target["field"]
+
+        # 动态任务 id：取 T 序列中未占用的编号
+        occupied = {t.get("task_id") for t in state.get("sub_tasks", [])}
+        occupied |= self._completed_tasks | self._dispatched_tasks
+        next_id = 1
+        while f"T{next_id}" in occupied:
+            next_id += 1
+        tid = f"T{next_id}"
+
+        task = {
+            "task_id": tid,
+            "task_name": f"执行{algo}产出{field}",
+            "goal": f"调用算法 {algo} 对目标执行侦察，产出字段 {field} 数据，供信息处理 agent 使用。",
+            "executor": "uav",
+            "assigned_uav_role": None,
+            "prerequisite_tasks": [],
+            "constraints": [f"必须调用算法 {algo} 采集并产出 {field} 数据"],
+            "dynamic_dependency": True,
+        }
+        state.setdefault("sub_tasks", []).append(task)
+        if tid not in agent._assigned_task_ids:
+            agent._assigned_task_ids.append(tid)
+        self.task_to_agent[tid] = agent.agent_id
+        state.setdefault("_pending_dependency", {})[tid] = {
+            "requester": from_id,
+            "correlation_id": correlation_id,
+            "tool_name": msg.get("payload", {}).get("tool_name", ""),
+            "action_name": msg.get("payload", {}).get("action_name", ""),
+            "field": field,
+            "missing": missing,
+        }
+        # 不直接派发：加入分配队列，由 tick 的 _tick_agent 在该 agent 空闲时正常派发
+        # （避免在 agent 忙碌时用 Kafka 消息覆盖其当前任务）
+        print(f"[FLEET] 缺参数据依赖：{from_id} 缺 {field} → 排队动态子任务 {tid}({algo}) → agent={agent.agent_id}（空闲时派发）",
+              file=sys.stderr, flush=True)
+        return True
 
     async def _derive_param_via_algorithm(self, state: AgentState, msg: dict, missing: list, ctx: dict) -> dict:
         """指挥 LLM：判断能否用现有信息调用某算法得到缺失参数"""
@@ -631,6 +714,25 @@ class FleetManager:
         if not values and len(params) == 1 and user_input.strip():
             values[params[0].get("name")] = user_input.strip()
 
+        # 防死循环：用户多次未能提供有效参数值 → 标记当前动作失败，不再无限重问
+        if not values:
+            gkey = f"{agent_id}:{info.get('tool_name', '')}"
+            gc = state.setdefault("_user_param_giveup", {}).get(gkey, 0) + 1
+            state["_user_param_giveup"][gkey] = gc
+            if gc >= 3:
+                sys.stderr.write(f"[Fleet] 用户多次无法提供参数({gkey})，标记当前动作失败\n")
+                sys.stderr.flush()
+                await self._send_reply(
+                    state, agent_id,
+                    "用户多次无法提供该参数，已标记当前动作失败。",
+                    correlation_id,
+                    payload={"kind": "param_failed", "params": [p.get("name", "") for p in params]},
+                )
+                state["_awaiting_user_param"] = {}
+                state["_sub_awaiting"] = ""
+                state["user_input"] = ""
+                return
+
         sys.stderr.write(f"[Fleet] 用户提供的参数值: {values}\n")
         sys.stderr.flush()
 
@@ -785,6 +887,13 @@ class FleetManager:
                     state["_current_task_idx"] = i
                     break
         else:
+            # 全部任务完成：会话切换前最后一次排空收件箱。
+            # 最后一步动作的 action_executed 上报可能仍滞留在生产者缓冲中
+            # （aiokafka 默认 linger_ms=5ms），先等待其刷新再消费，否则该上报
+            # 会在会话切换后被「非本会话」过滤器丢弃，导致脚本漏掉最后一行。
+            await self._process_coordinator_inbox(state)
+            await asyncio.sleep(0.1)
+            await self._process_coordinator_inbox(state)
             state["_fleet_all_done"] = True
             return
 
@@ -801,6 +910,11 @@ class FleetManager:
             if self.redis_mgr:
                 for a in all_agents:
                     self.redis_mgr.save_agent_state(a.agent_id, a.state)
+
+        # 阶段2.5：gather 期间各 agent 新上报的 report/result 立即消费。
+        # 子 agent 在 run_step 末尾异步投递 action_executed/result 并置 status=done，
+        # 若不在此排空，完成路径/会话切换会跑在这些上报被消费之前，导致最后一步动作漏写脚本。
+        await self._process_coordinator_inbox(state)
 
         # 死锁检测：仍有未完成任务，但没有任何 agent 在运行（且没有可派发的就绪任务）
         any_running = any(a.status == "running" for a in self.sub_agents.values()) or (
@@ -838,6 +952,10 @@ class FleetManager:
 
         # 完成/出错：归档结果 + 重置 agent，准备下一个任务
         if agent.is_done:
+            # 收尾前先排空指挥收件箱：该 agent 最后一步动作的 action_executed/result
+            # 由 run_step 异步投递，可能仍在收件箱/生产者缓冲中。先消费完再标记完成，
+            # 否则刷新依赖、派发下一任务、会话切换都会抢先，导致最后一步漏写脚本。
+            await self._process_coordinator_inbox(state)
             tid = task.get("task_id", "")
             if tid and tid not in self._completed_tasks:
                 self._completed_tasks.add(tid)
@@ -860,6 +978,20 @@ class FleetManager:
                 except Exception as e:
                     sys.stderr.write(f"[Fleet] LLM 依赖兜底失败: {e}\n")
                     sys.stderr.flush()
+                # 动态依赖任务完成：回复挂起的请求者（缺参数据已产出，重试当前动作）
+                dep = state.get("_pending_dependency", {}).get(tid)
+                if dep:
+                    try:
+                        await self._send_reply(
+                            state, dep.get("requester", ""),
+                            f"依赖数据（{dep.get('field', '')}）已由 {agent_id} 产出，请重试当前动作。",
+                            dep.get("correlation_id"),
+                            payload={"kind": "param_value", "values": {}},
+                        )
+                    except Exception as e:
+                        sys.stderr.write(f"[Fleet] 依赖任务完成回复失败: {e}\n")
+                        sys.stderr.flush()
+                    state.setdefault("_pending_dependency", {}).pop(tid, None)
             agent.reset_for_next_task()
 
         # idle：找就绪任务并通过 Kafka 派发（每个任务只派发一次）
