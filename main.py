@@ -1,5 +1,6 @@
 """主入口：MCP 连接 → 工具注册 → RAG 初始化 → 图构建 → 交互循环"""
 import asyncio
+import os
 import sys
 import time
 import uuid
@@ -25,6 +26,13 @@ async def main():
     # 初始化 Redis 管理器
     redis_mgr = get_redis_manager()
     _t0 = time.perf_counter()
+
+    # Ollama 服务端并行检测：多 agent 并发时未开 OLLAMA_NUM_PARALLEL 会退化为串行排队
+    if not os.environ.get("OLLAMA_NUM_PARALLEL"):
+        print("[提示] 未检测到 OLLAMA_NUM_PARALLEL（Ollama 服务端并发参数）。", flush=True)
+        print("       多 agent 并发规划/执行将退化为串行排队。请在 ollama serve 启动前设置：", flush=True)
+        print("         PowerShell: $env:OLLAMA_NUM_PARALLEL=8; ollama serve", flush=True)
+        print("       设置后需重启 ollama serve 服务。", flush=True)
     
     # 生成会话ID
     session_id = str(uuid.uuid4())[:8]

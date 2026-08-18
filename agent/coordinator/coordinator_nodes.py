@@ -593,9 +593,11 @@ async def fleet_dispatcher_node(state: AgentState, deps: Deps) -> AgentState:
                         agent.inject_user_input(state["user_input"])
                 state["_sub_awaiting"] = ""
 
-    # 仍有排队待确认/回答的问题（如下一架无人机的方案）：立即返回给用户展示，
-    # 不推进 tick —— 否则长耗时的 run_step（如刚确认的 UAV 的详细规划）会把本轮问题吞掉
+    # 仍有排队待确认/回答的问题（如下一架无人机的方案）：不阻塞整队，
+    # 只推进已进入执行阶段的 agent（detail_plan_confirmed）执行已保存动作（快速工具调用），
+    # 不推进规划/待确认 agent —— 长耗时的 run_step（如刚确认的 UAV 的详细规划）仍会吞掉本轮问题
     if state.get("_sub_awaiting"):
+        await fleet_mgr.advance_confirmed_execution(state)
         return state
 
     # 推进一步

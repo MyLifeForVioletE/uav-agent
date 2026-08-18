@@ -98,13 +98,29 @@ pip install langgraph langchain-ollama langchain-core langchain-mcp-adapters chr
 
 ### 1. Ollama（`http://127.0.0.1:11434`）
 
-```bash
+多 agent 并发规划/执行时，8 架 UAV 会同时请求 LLM。Ollama 默认对同一模型**串行**处理请求，并发会退化为排队（单次长耗时的 LLM 调用就是瓶颈），必须在 `ollama serve` 启动前设置服务端并行参数：
+
+```powershell
+# Windows PowerShell（先设环境变量，再启动服务）
+$env:OLLAMA_NUM_PARALLEL=8      # 同模型并发请求数（≥ 子 agent 数量）
+$env:OLLAMA_MAX_LOADED_MODELS=4 # 最多同时驻留的模型数（含 embedding/rerank）
 ollama serve
+```
+
+```bash
+# Linux/macOS
+OLLAMA_NUM_PARALLEL=8 OLLAMA_MAX_LOADED_MODELS=4 ollama serve
+```
+
+```bash
 # 拉取项目依赖的 3 个模型
 ollama pull ExpedientFalcon/qwen3-4b-agent:latest
 ollama pull bge-m3:latest
 ollama pull qllama/bge-reranker-v2-m3:latest
 ```
+
+> **注意**：`OLLAMA_NUM_PARALLEL` 是 `ollama serve` **服务端**环境变量，需在启动 Ollama 服务前设置、修改后重启服务才生效。应用启动时若检测到并发请求超时，多为该参数未生效导致排队。
+> 显存较小时可降低并行度；若无需多模型同驻，`OLLAMA_MAX_LOADED_MODELS=1` 亦可（仅并发数生效）。
 
 ### 2. Redis（`127.0.0.1:6379`，Docker）
 

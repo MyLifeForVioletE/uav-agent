@@ -84,12 +84,21 @@ class FleetManager:
         self._dispatched_tasks: set = set()           # 已通过 Kafka 派发的 task_id 集合（每个任务只派发一次）
         self._processor_agent: SubAgent | None = None  # 信息处理类子任务的 agent
         self._bus = get_kafka_bus()
+        # 缺参请示连续卡死 tick 阈值：超过则强制跳过动作（见 _resolve_stuck_param_waits）
+        self._STUCK_AWAIT_TICKS = 2
+        # 连续无推进 tick 阈值：超过则强制结束，避免无限空转刷屏
+        self._STALL_TICK_LIMIT = 30
+        # 上次保存时的 agent 状态签名（避免空转期重复 save_agent_state 刷日志）
+        self._last_saved_sig: Dict[str, str] = {}
+        # 本轮 tick 是否有实质推进（消费了消息 / 派发了任务）——用于空转保护
+        self._last_tick_activity = False
     
     def initialize_sub_agents(self, state: AgentState):
         """根据 uav_configs 创建子 agent 实例 + 创建信息处理 agent"""
         configs = state.get("uav_configs", [])
         assignments = state.get("sub_task_assignments", {})
         session_id = state.get("session_id", "default")
+        self._last_saved_sig.clear()
         
         for config in configs:
             uav_id = config["uav_id"]
@@ -136,6 +145,7 @@ class FleetManager:
 
             session_id = state.get("session_id", "default")
             mailbox = state.setdefault("coordinator_mailbox", [])
+            self._last_tick_activity = True
             for m in msgs:
                 mtype = m.get("msg_type", "")
                 from_id = m.get("from", "")
@@ -863,6 +873,7 @@ class FleetManager:
 
     async def tick(self, state: AgentState):
         """推进一步：逐 agent 推进生命周期（派发就绪任务 / 推进运行 / 完成收尾）"""
+        self._last_tick_activity = False
         # 首次 tick：清空各收件箱残留消息（此时本会话尚未产生任何消息，安全）
         if self._bus and state.get("_fleet_tick_count", 0) == 0:
             await self._bus.flush_inbox(self._COORD_ID)
@@ -917,7 +928,10 @@ class FleetManager:
                 await asyncio.gather(*[a.run_step() for a in all_agents])
                 if self.redis_mgr:
                     for a in all_agents:
-                        self.redis_mgr.save_agent_state(a.agent_id, a.state)
+                        sig = self._agent_state_sig(a)
+                        if sig != self._last_saved_sig.get(a.agent_id):
+                            self.redis_mgr.save_agent_state(a.agent_id, a.state)
+                            self._last_saved_sig[a.agent_id] = sig
 
         # 阶段2.5：gather 期间各 agent 新上报的 report/result 立即消费。
         # 子 agent 在 run_step 末尾异步投递 action_executed/result 并置 status=done，
@@ -925,21 +939,177 @@ class FleetManager:
         with timing.track("阶段2.5排空上报"):
             await self._process_coordinator_inbox(state)
 
+        # 缺参挂起兜底：连续多个 tick 未收到缺参回复且指挥无待处理项 → 强制跳过动作。
+        # 每 tick 都调用（内部有连续计数），确保在 tick 上限前一定触发。
+        resolved_stuck = await self._resolve_stuck_param_waits(state)
+
         # 死锁检测：仍有未完成任务，但没有任何 agent 在运行（且没有可派发的就绪任务）
-        any_running = any(a.status == "running" for a in self.sub_agents.values()) or (
+        # 注意：仅因缺参挂起（_awaiting_reply）而显示 running 的 agent 视为「卡死」，
+        # 不计入 any_running，否则空转永远不会被死锁检测兜住（tick 上限前无法结束）。
+        await_user_param = state.get("_awaiting_user_param") or {}
+        await_user_confirm = state.get("_awaiting_user_confirm") or {}
+        pending_dep = state.get("_pending_dependency") or {}
+        stuck_awaiting = {
+            a.agent_id for a in list(self.sub_agents.values()) + ([self._processor_agent] if self._processor_agent else [])
+            if a is not None and a._awaiting_reply and a._pending_resolution
+            and not (await_user_param.get("agent_id") == a.agent_id
+                     or a.agent_id in await_user_confirm
+                     or any(d.get("requester") == a.agent_id for d in pending_dep.values()))
+        }
+        any_running = any(
+            a.status == "running" and a.agent_id not in stuck_awaiting
+            for a in self.sub_agents.values()
+        ) or (
             self._processor_agent is not None and self._processor_agent.status == "running"
+            and self._processor_agent.agent_id not in stuck_awaiting
         )
         if remaining and not any_running:
             all_agents = list(self.sub_agents.values()) + ([self._processor_agent] if self._processor_agent else [])
-            idle_with_work = any(self._find_ready_task(a, sub_tasks) is not None for a in all_agents)
+            idle_with_work = any(
+                a.agent_id not in stuck_awaiting and self._find_ready_task(a, sub_tasks) is not None
+                for a in all_agents if a is not None
+            )
             if not idle_with_work:
-                print(f"[DEBUG tick #{tick_count}] NO executable task found (deadlock)", file=sys.stderr, flush=True)
-                state["_fleet_all_done"] = True
-                state["output"] = "[Fleet] 所有任务被前置依赖阻塞，无法继续执行"
-                return
-        
+                # 已尝试强制跳过缺参卡死 agent；仍无法推进则判定真死锁
+                still_blocked = [
+                    a for a in all_agents if a is not None and (a._awaiting_reply or a.status == "running")
+                ]
+                if not still_blocked or not resolved_stuck:
+                    print(f"[DEBUG tick #{tick_count}] NO executable task found (deadlock)", file=sys.stderr, flush=True)
+                    state["_fleet_all_done"] = True
+                    state["output"] = "[Fleet] 所有任务被前置依赖阻塞，无法继续执行"
+                    return
+
+        # 空转保护：连续多 tick 无任何推进（无回复消费、无任务派发、无真正在跑的 agent）
+        # → 强制结束，停止刷日志。注意：缺参挂起的「running」不计入活动（防误判为有进展）。
+        genuine_running = any(
+            a.status == "running" and a.agent_id not in stuck_awaiting
+            for a in list(self.sub_agents.values()) + ([self._processor_agent] if self._processor_agent else [])
+            if a is not None
+        )
+        stall_count = state.get("_fleet_stall_count", 0)
+        if self._last_tick_activity or genuine_running:
+            stall_count = 0
+        else:
+            stall_count += 1
+        state["_fleet_stall_count"] = stall_count
+        if stall_count >= self._STALL_TICK_LIMIT:
+            print(f"[DEBUG tick #{tick_count}] STALL: 连续 {stall_count} tick 无推进，强制结束", file=sys.stderr, flush=True)
+            state["_fleet_all_done"] = True
+            state["output"] = "[Fleet] 连续无推进，强制结束"
+            return
+
         # 更新 fleet 状态
         self._update_fleet_state(state)
+
+    async def _resolve_stuck_param_waits(self, state: AgentState) -> bool:
+        """缺参挂起兜底：子 agent 发出缺参请示后连续多个 tick 未收到回复，且指挥侧
+        当前没有该 agent 的待处理项（请示/回复丢失、动态依赖断链等），则强制回发
+        param_failed 并本地清挂起，让该 agent 跳过当前动作继续执行，避免整队无限空转。
+
+        判定采用「连续卡死 tick 计数」（阈值 _STUCK_AWAIT_TICKS）而非墙钟时长，
+        保证在 tick 上限之前一定能触发，且不受 tick 速度影响。
+
+        返回 True 表示至少强制跳过了 1 个 agent（后续应重新评估是否仍卡死）。
+        """
+        if state.get("_sub_awaiting"):
+            return False
+        await_user_param = state.get("_awaiting_user_param") or {}
+        await_user_confirm = state.get("_awaiting_user_confirm") or {}
+        pending_dep = state.get("_pending_dependency") or {}
+        agents = list(self.sub_agents.items()) + [(self._PROCESSOR_ID, self._processor_agent)]
+        stuck = {}
+        for agent_id, agent in agents:
+            if agent is None:
+                continue
+            if not agent._awaiting_reply or not agent._pending_resolution:
+                continue
+            # 指挥侧正在等这个 agent 的某项回复 → 不判定为卡死
+            if await_user_param.get("agent_id") == agent_id:
+                continue
+            if agent_id in await_user_confirm:
+                continue
+            if any(d.get("requester") == agent_id for d in pending_dep.values()):
+                continue
+            stuck[agent_id] = agent
+
+        counters = state.setdefault("_stuck_await_ticks", {})
+        resolved = False
+        for agent_id, agent in stuck.items():
+            counters[agent_id] = counters.get(agent_id, 0) + 1
+            if counters[agent_id] < self._STUCK_AWAIT_TICKS:
+                continue
+            sys.stderr.write(
+                f"[Fleet] {agent_id} 缺参挂起连续 {counters[agent_id]} tick 且指挥无对应待处理项，"
+                f"强制跳过当前动作继续执行\n"
+            )
+            sys.stderr.flush()
+            try:
+                await self._send_reply(
+                    state, agent_id,
+                    "指挥长时间未回复缺参请示，已标记当前动作失败，请继续后续动作。",
+                    agent._awaiting_reply,
+                    payload={"kind": "param_failed", "params": []},
+                )
+            except Exception as e:
+                sys.stderr.write(f"[Fleet] {agent_id} 超时强制跳过回复失败: {e}\n")
+                sys.stderr.flush()
+            # 即使回复因故未送达，也直接本地清挂起，避免 run_step 一直早退
+            agent._awaiting_reply = None
+            agent._pending_resolution = None
+            agent._retry_action = None
+            agent.state["_skip_current_action"] = True
+            resolved = True
+        # 已恢复（不再挂起）的 agent 清零计数
+        for agent_id in list(counters):
+            if agent_id not in stuck:
+                counters.pop(agent_id, None)
+        return resolved
+
+    def _agent_state_sig(self, agent) -> str:
+        """轻量状态签名：仅覆盖决定「是否值得写 Redis」的关键字段，避免每 tick 全量序列化"""
+        s = getattr(agent, "state", {}) or {}
+        try:
+            actions_sig = json.dumps(s.get("detail_actions", []), ensure_ascii=False, default=str)
+        except Exception:
+            actions_sig = f"{len(s.get('detail_actions', []))}"
+        return json.dumps({
+            "status": getattr(agent, "status", ""),
+            "progress": getattr(agent, "progress", 0.0),
+            "last_output": getattr(agent, "last_output", ""),
+            "step_idx": s.get("current_step_idx", 0),
+            "pending_q": s.get("pending_question", ""),
+            "skip": s.get("_skip_current_action", False),
+            "confirmed": s.get("detail_plan_confirmed", False),
+            "actions": actions_sig,
+            "n_msgs": len(s.get("messages", [])),
+        }, ensure_ascii=False)
+
+    async def advance_confirmed_execution(self, state: AgentState):
+        """确认等待期的轻量推进：只推进已进入执行阶段（detail_plan_confirmed=True）
+        的子 agent 执行已保存动作（快速工具调用），不推进规划/待确认 agent。
+
+        目的：用户逐条确认多架无人机规划时，已确认的无人机立即开始执行，
+        无需等确认队列全部清空。挂起中的 agent（_awaiting_reply）在 run_step
+        开头直接返回，天然不会在此被推进；长耗时的规划 run_step 也不会在本方法触发。
+        """
+        exec_agents = [
+            a for _, a in list(self.sub_agents.items()) + [(self._PROCESSOR_ID, self._processor_agent)]
+            if a is not None and a.state.get("detail_plan_confirmed")
+        ]
+        if not exec_agents:
+            return
+        with timing.track("确认期推进执行"):
+            await asyncio.gather(*[a.run_step() for a in exec_agents])
+            if self.redis_mgr:
+                for a in exec_agents:
+                    sig = self._agent_state_sig(a)
+                    if sig != self._last_saved_sig.get(a.agent_id):
+                        self.redis_mgr.save_agent_state(a.agent_id, a.state)
+                        self._last_saved_sig[a.agent_id] = sig
+            # 推进执行产生的 action_executed 上报需立即消费（写脚本），
+            # 否则会在确认队列清空前滞留，导致确认期间执行的步骤漏写脚本。
+            await self._process_coordinator_inbox(state)
 
     def _find_ready_task(self, agent, sub_tasks: list) -> dict | None:
         """按分配顺序找到该 agent 第一个「未完成且前置依赖就绪」的任务"""
@@ -1018,6 +1188,7 @@ class FleetManager:
                         print(f"[FLEET]   前置 {pid}: output={summary!r} actions_count={has_actions} status={pval.get('status','')}", file=sys.stderr, flush=True)
                     await self._dispatch_task_via_kafka(state, agent, enriched_task)
                     self._dispatched_tasks.add(tid)
+                    self._last_tick_activity = True
     
     def _update_fleet_state(self, state: AgentState):
         """将各子agent状态汇总到 uav_states"""
