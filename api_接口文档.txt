@@ -1,0 +1,134 @@
+============================================================
+UAV Agent 多机协同规划系统 —— HTTP 接口文档
+============================================================
+
+服务地址：http://127.0.0.1:8000  (默认端口，可通过 --port 修改)
+启动命令：python -m uvicorn http_server:app --host 0.0.0.0 --port 8000
+
+说明：
+1. 本服务为"无确认自动模式"：提交任务描述后自动完成
+   参数收集 → 任务分解 → 任务分配 → 多机协同执行 全部流程，
+   全程不需要用户确认或补充输入。
+2. 最终产物为两个脚本文件（JSON）：
+   - 动作脚本   actions_script_{sid}.json
+   - 异常应对   contingency_plan_{sid}.json
+3. 前置依赖：Redis、Kafka、Ollama 需已启动。
+
+------------------------------------------------------------
+接口 1：提交任务（执行整个协同流程）
+------------------------------------------------------------
+POST /api/run
+
+请求头：Content-Type: application/json
+
+请求体（JSON）：
+{
+  "scenario": "任务描述文本"
+}
+
+字段说明：
+  scenario (string, 必填)：用户输入的任务描述，如
+    "现在有一个任务，使用一架侦察无人机到位置1侦察敌方的一个通信目标。期望得到敌方通信目标的频率、带宽、信号强度信息。该目标通信使用的频率在2~3GHz，步进为500。无人机现在处于基地，基地位置在70，15，目标位置在70，15.01 "
+
+请求示例：
+curl -X POST http://127.0.0.1:8000/api/run \
+  -H "Content-Type: application/json" \
+  -d '{"scenario":"现在有一个任务，使用一架侦察无人机到位置1侦察敌方的一个通信目标。期望得到敌方通信目标的频率、带宽、信号强度信息。该目标通信使用的频率在2~3GHz，步进为500。无人机现在处于基地，基地位置在70，15，目标位置在70，15.01 "}'
+
+响应（JSON，HTTP 200）：
+{
+  "session_id": "42e516fe",
+  "actions_script_url": "/api/files/42e516fe/actions",
+  "contingency_plan_url": "/api/files/42e516fe/contingency"
+}
+
+字段说明：
+  session_id (string)：本次任务的会话ID，后续下载脚本需用到
+  actions_script_url (string)：动作脚本下载地址（相对路径，需拼接服务地址）
+  contingency_plan_url (string)：异常应对文件下载地址（相对路径）
+
+错误响应：
+  HTTP 400：scenario 为空
+    { "detail": "scenario 不能为空" }
+  HTTP 503：服务尚未初始化完成
+    { "detail": "服务未就绪" }
+
+注意：
+  - 该接口为同步阻塞：会一直等到整个协同执行完成才返回，
+    耗时取决于任务复杂度（可能几十秒到数分钟）。
+  - 前端调用时应等待响应，期间可显示"执行中"加载状态。
+
+------------------------------------------------------------
+接口 2：下载动作脚本
+------------------------------------------------------------
+GET /api/files/{session_id}/actions
+
+路径参数：
+  session_id (string)：接口1返回的 session_id
+
+请求示例：
+curl http://127.0.0.1:8000/api/files/42e516fe/actions
+
+响应（HTTP 200）：JSON 文件内容，Content-Type: application/json
+  文件即 output/actions_script_{session_id}.json，
+  为按执行顺序排列的动作步骤列表（steps 数组），
+  每个动作包含：动作名、执行主体、工具调用参数、输出、依赖关系等。
+
+错误响应：
+  HTTP 404：文件不存在
+    { "detail": "文件不存在: actions_script_xxxx.json" }
+
+------------------------------------------------------------
+接口 3：下载异常应对文件
+------------------------------------------------------------
+GET /api/files/{session_id}/contingency
+
+路径参数：
+  session_id (string)：接口1返回的 session_id
+
+请求示例：
+curl http://127.0.0.1:8000/api/files/42e516fe/contingency
+
+响应（HTTP 200）：JSON 文件内容，Content-Type: application/json
+  文件即 output/contingency_plan_{session_id}.json，
+  结构为 {"plan": [...]}，每条包含：
+    step / action_id / action_name / tool_name / goal / contingency
+  contingency 为异常应对措施列表（condition 触发条件 + 切换目标动作）。
+
+错误响应：
+  HTTP 404：文件不存在
+    { "detail": "文件不存在: contingency_plan_xxxx.json" }
+
+------------------------------------------------------------
+接口 4：健康检查
+------------------------------------------------------------
+GET /api/health
+
+请求示例：
+curl http://127.0.0.1:8000/api/health
+
+响应（JSON，HTTP 200）：
+{
+  "status": "ok",
+  "ready": true
+}
+
+字段说明：
+  status (string)：服务状态，固定为 "ok"
+  ready (boolean)：是否已就绪（true=可提交任务，false=仍在初始化）
+
+------------------------------------------------------------
+前端对接推荐流程
+------------------------------------------------------------
+1. 页面加载：GET /api/health 确认 ready=true
+2. 用户输入任务：POST /api/run 提交 {scenario}
+   → 等待响应（显示加载动画）
+3. 拿到 session_id 后：
+   - 下载按钮1：GET /api/files/{sid}/actions
+   - 下载按钮2：GET /api/files/{sid}/contingency
+   （两个下载地址即接口1响应的两个 URL，拼上服务地址即可）
+
+完整地址示例：
+  http://127.0.0.1:8000/api/files/42e516fe/actions
+  http://127.0.0.1:8000/api/files/42e516fe/contingency
+============================================================
