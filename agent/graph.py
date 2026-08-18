@@ -21,10 +21,10 @@ def build_graph(deps: Deps):
 
     def _idle(s):
         return idle_node(s, deps)
-    def _router(s):
-        return router_node(s, deps)
-    def _planning_prep(s):
-        return planning_prep(s, deps)
+    async def _router(s):
+        return await router_node(s, deps)
+    async def _planning_prep(s):
+        return await planning_prep(s, deps)
     async def _call_llm(s):
         return await call_llm(s, deps)
     async def _execute_tools(s):

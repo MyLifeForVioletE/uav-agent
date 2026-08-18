@@ -12,6 +12,7 @@ from core.state import AgentState, Deps
 from core.redis_manager import RedisManager
 from core.config import BASE_DIR, COORDINATOR_ID
 from core.kafka_bus import get_kafka_bus
+from core.timing import timing
 from agent.sub_agent import SubAgent
 from tools.script_writer import write_action_step, write_pause_marker, refresh_dependencies_with_llm
 
@@ -869,7 +870,8 @@ class FleetManager:
                 await self._bus.flush_inbox(agent_id)
 
         # 先处理指挥 agent 收件箱（子 agent 的上报/请示/结果）
-        await self._process_coordinator_inbox(state)
+        with timing.track("指挥收件箱处理"):
+            await self._process_coordinator_inbox(state)
 
         sub_tasks = state.get("sub_tasks", [])
 
@@ -902,23 +904,26 @@ class FleetManager:
             return
 
         # 阶段1（串行）：完成/出错归档 + 重置 + 派发就绪任务（操作共享状态，必须串行）
-        for agent_id, agent in list(self.sub_agents.items()) + [(self._PROCESSOR_ID, self._processor_agent)]:
-            if agent is None:
-                continue
-            await self._tick_agent(state, agent_id, agent, sub_tasks)
+        with timing.track("阶段1串行归档/派发"):
+            for agent_id, agent in list(self.sub_agents.items()) + [(self._PROCESSOR_ID, self._processor_agent)]:
+                if agent is None:
+                    continue
+                await self._tick_agent(state, agent_id, agent, sub_tasks)
 
         # 阶段2（并行）：所有 agent 的 run_step 并发推进（RAG/LLM 调用时间重叠，真并行）
         all_agents = [a for _, a in list(self.sub_agents.items()) + [(self._PROCESSOR_ID, self._processor_agent)] if a is not None]
         if all_agents:
-            await asyncio.gather(*[a.run_step() for a in all_agents])
-            if self.redis_mgr:
-                for a in all_agents:
-                    self.redis_mgr.save_agent_state(a.agent_id, a.state)
+            with timing.track("阶段2并行run_step"):
+                await asyncio.gather(*[a.run_step() for a in all_agents])
+                if self.redis_mgr:
+                    for a in all_agents:
+                        self.redis_mgr.save_agent_state(a.agent_id, a.state)
 
         # 阶段2.5：gather 期间各 agent 新上报的 report/result 立即消费。
         # 子 agent 在 run_step 末尾异步投递 action_executed/result 并置 status=done，
         # 若不在此排空，完成路径/会话切换会跑在这些上报被消费之前，导致最后一步动作漏写脚本。
-        await self._process_coordinator_inbox(state)
+        with timing.track("阶段2.5排空上报"):
+            await self._process_coordinator_inbox(state)
 
         # 死锁检测：仍有未完成任务，但没有任何 agent 在运行（且没有可派发的就绪任务）
         any_running = any(a.status == "running" for a in self.sub_agents.values()) or (

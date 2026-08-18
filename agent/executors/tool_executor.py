@@ -12,6 +12,7 @@ from typing import Optional
 from core.config import BASE_DIR
 from core.ollama_utils import producer_algos_for_field
 from core.redis_manager import get_redis_manager
+from core.timing import timing
 
 
 # knowledge 目录支持的文件类型
@@ -964,6 +965,8 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
             sys.stderr.write(f"[ToolExecutor] flight 已取 Redis 航迹点 {len(wp)} 个\n")
             sys.stderr.flush()
 
+    # 预处理：跳过占位/已有值参数，非 exe 清空 LLM 猜测值（顺序执行，无 I/O）
+    resolve_params = []
     for param_name in required_params:
         param_value = tool_inputs.get(param_name, "")
         # 空占位保护已把该参数置为参数名（值为参数名），跳过查找
@@ -977,20 +980,29 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
             sys.stderr.write(f"[ToolExecutor] 非exe 清除 LLM 猜测值: {param_name}={param_value}\n")
             sys.stderr.flush()
             tool_inputs[param_name] = ""
+        resolve_params.append(param_name)
 
-        sys.stderr.write(f"[ToolExecutor] 参数 {param_name} 为空，开始查找...\n")
-        sys.stderr.flush()
-        
+    # file 类型参数依赖 knowledge 目录扫描，若存在先扫描一次（并发任务共享，只读）
+    if knowledge_files is None and any(
+        input_schema.get(p, {}).get("type", "string") == "file" for p in resolve_params
+    ):
+        knowledge_files = _scan_knowledge_dir()
+
+    # 哨兵：区分 file 参数（不重绑定 context）与非 file 参数（即使 Redis 返回 None 也重绑定）
+    _NO_CTX = object()
+
+    async def _resolve_param(param_name: str):
+        """解析单个参数：file 类型走 LLM 选文件，其余走 Redis 上下文 + LLM 提取 + 本地降级。
+        各参数互相独立（只读上下文、写各自 tool_inputs key），可安全并发。
+        Returns: (param_name, 解析值或 None, 本次获取的 Redis 上下文，file 参数为 _NO_CTX)"""
         param_info = input_schema.get(param_name, {})
         param_desc = param_info.get("description", param_name)
         param_type = param_info.get("type", "string")
-        param_meta = {"type": param_type, "description": param_desc}
-        
+
+        sys.stderr.write(f"[ToolExecutor] 参数 {param_name} 为空，开始查找...\n")
+        sys.stderr.flush()
+
         if param_type == "file":
-            # file 类型：扫描 knowledge 目录选择文件
-            if knowledge_files is None:
-                knowledge_files = _scan_knowledge_dir()
-            
             if knowledge_files:
                 selected_path = await _llm_select_file(
                     llm, knowledge_files, scene_description, param_name, param_desc
@@ -998,71 +1010,86 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
                 if selected_path:
                     sys.stderr.write(f"[ToolExecutor] LLM选择文件: {param_name}={selected_path}\n")
                     sys.stderr.flush()
-                    tool_inputs[param_name] = selected_path
-                    continue
-        else:
-            # 非 file 类型：从结构化上下文中 LLM 提取
-            context = redis_mgr.get_context(session_id)
-            sys.stderr.write(f"[ToolExecutor] 结构化上下文: {'有' if context else '空'}\n")
+                    return param_name, selected_path, _NO_CTX
+            return param_name, None, _NO_CTX
+
+        ctx = redis_mgr.get_context(session_id)
+        sys.stderr.write(f"[ToolExecutor] 结构化上下文: {'有' if ctx else '空'}\n")
+        sys.stderr.flush()
+        if not ctx:
+            sys.stderr.write(f"[ToolExecutor] 无结构化上下文\n")
             sys.stderr.flush()
-            if context and llm:
-                # 真实 exe（当前只有 path_planning）的坐标参数语义固定：出航终点=目标点，
-                # 返航终点=基地。_local_resolve_param 含返航优先 base 的逻辑，可确定性区分；
-                # 而 LLM 容易被 uavs.*.path.to_lon/to_lat（上次出航终点）干扰，返航时会把
-                # 旧目标点当终点。因此真实 exe 先走本地语义解析，LLM 仅作兜底。
-                local_tried = False
-                if real_exec:
-                    local_value = _local_resolve_param(context, param_name, param_desc, param_type,
-                                                       agent_id=agent_id, goal=goal, scene_text=scene_description)
-                    local_tried = True
-                    if local_value:
-                        sys.stderr.write(f"[ToolExecutor] path_planning 本地语义解析: {param_name}={local_value}\n")
-                        sys.stderr.flush()
-                        tool_inputs[param_name] = local_value
-                        continue
-                extracted_value = await _llm_extract_from_context(
-                    llm, param_name, param_desc, param_type, context, goal
-                )
-                if extracted_value:
-                    extracted_value = _pick_coord_component(extracted_value, param_name, param_desc)
-                    # 频率范围兜底：min/max 频率参数命中范围字符串时拆出对应分量
-                    extracted_value = _freq_component(extracted_value, param_name, param_desc)
-                    sys.stderr.write(f"[ToolExecutor] LLM提取: {param_name}={extracted_value}\n")
-                    sys.stderr.flush()
-                    tool_inputs[param_name] = extracted_value
-                    continue
-                elif not real_exec:
-                    # 不执行 exe 的算法：LLM 未查到值 → 本地键值/别名直取（值必须来自上下文原文，
-                    # 与 targetMinFreq 命中 targets.T1.minFreq 同理），仍找不到才留空，
-                    # 交给末尾"非 exe 缺参用参数名占位"处理（写脚本时显示参数名）。
-                    local_value = _local_resolve_param(context, param_name, param_desc, param_type,
-                                                       agent_id=agent_id, goal=goal, scene_text=scene_description)
-                    if local_value:
-                        sys.stderr.write(f"[ToolExecutor] LLM提取失败(非exe)，本地键值补齐: {param_name}={local_value}\n")
-                        sys.stderr.flush()
-                        tool_inputs[param_name] = local_value
-                        continue
-                    sys.stderr.write(f"[ToolExecutor] LLM提取失败(非exe)，{param_name} 保持为空，交由参数名占位\n")
-                    sys.stderr.flush()
-                else:
-                    # 真实 exe（path_planning 已在上方优先尝试本地解析，失败才走到这里）：
-                    # LLM 超时/失败/返回 NONE → 本地降级，仍缺才进入 missing_params
-                    if not local_tried:
-                        local_value = _local_resolve_param(context, param_name, param_desc, param_type,
-                                                           agent_id=agent_id, goal=goal, scene_text=scene_description)
-                        if local_value:
-                            sys.stderr.write(f"[ToolExecutor] LLM提取失败，本地降级补齐: {param_name}={local_value}\n")
-                            sys.stderr.flush()
-                            tool_inputs[param_name] = local_value
-                            continue
-                    sys.stderr.write(f"[ToolExecutor] LLM提取失败且本地无法补齐: {param_name}\n")
-                    sys.stderr.flush()
-            elif not context:
-                sys.stderr.write(f"[ToolExecutor] 无结构化上下文\n")
+            return param_name, None, ctx
+        if not llm:
+            sys.stderr.write(f"[ToolExecutor] LLM不可用\n")
+            sys.stderr.flush()
+            return param_name, None, ctx
+
+        # 真实 exe（当前只有 path_planning）的坐标参数语义固定：出航终点=目标点，
+        # 返航终点=基地。_local_resolve_param 含返航优先 base 的逻辑，可确定性区分；
+        # 而 LLM 容易被 uavs.*.path.to_lon/to_lat（上次出航终点）干扰，返航时会把
+        # 旧目标点当终点。因此真实 exe 先走本地语义解析，LLM 仅作兜底。
+        local_tried = False
+        if real_exec:
+            local_value = _local_resolve_param(ctx, param_name, param_desc, param_type,
+                                               agent_id=agent_id, goal=goal, scene_text=scene_description)
+            local_tried = True
+            if local_value:
+                sys.stderr.write(f"[ToolExecutor] path_planning 本地语义解析: {param_name}={local_value}\n")
                 sys.stderr.flush()
-            elif not llm:
-                sys.stderr.write(f"[ToolExecutor] LLM不可用\n")
+                return param_name, local_value, ctx
+
+        extracted_value = await _llm_extract_from_context(
+            llm, param_name, param_desc, param_type, ctx, goal
+        )
+        if extracted_value:
+            extracted_value = _pick_coord_component(extracted_value, param_name, param_desc)
+            # 频率范围兜底：min/max 频率参数命中范围字符串时拆出对应分量
+            extracted_value = _freq_component(extracted_value, param_name, param_desc)
+            sys.stderr.write(f"[ToolExecutor] LLM提取: {param_name}={extracted_value}\n")
+            sys.stderr.flush()
+            return param_name, extracted_value, ctx
+
+        if not real_exec:
+            # 不执行 exe 的算法：LLM 未查到值 → 本地键值/别名直取（值必须来自上下文原文，
+            # 与 targetMinFreq 命中 targets.T1.minFreq 同理），仍找不到才留空，
+            # 交给末尾"非 exe 缺参用参数名占位"处理（写脚本时显示参数名）。
+            local_value = _local_resolve_param(ctx, param_name, param_desc, param_type,
+                                               agent_id=agent_id, goal=goal, scene_text=scene_description)
+            if local_value:
+                sys.stderr.write(f"[ToolExecutor] LLM提取失败(非exe)，本地键值补齐: {param_name}={local_value}\n")
                 sys.stderr.flush()
+                return param_name, local_value, ctx
+            sys.stderr.write(f"[ToolExecutor] LLM提取失败(非exe)，{param_name} 保持为空，交由参数名占位\n")
+            sys.stderr.flush()
+        else:
+            # 真实 exe（path_planning 已在上方优先尝试本地解析，失败才走到这里）：
+            # LLM 超时/失败/返回 NONE → 本地降级，仍缺才进入 missing_params
+            if not local_tried:
+                local_value = _local_resolve_param(ctx, param_name, param_desc, param_type,
+                                                   agent_id=agent_id, goal=goal, scene_text=scene_description)
+                if local_value:
+                    sys.stderr.write(f"[ToolExecutor] LLM提取失败，本地降级补齐: {param_name}={local_value}\n")
+                    sys.stderr.flush()
+                    return param_name, local_value, ctx
+            sys.stderr.write(f"[ToolExecutor] LLM提取失败且本地无法补齐: {param_name}\n")
+            sys.stderr.flush()
+        return param_name, None, ctx
+
+    # 并发解析所有待填参数（互相独立）：N 次 LLM/上下文往返从串行 N× 降为 ~1×
+    if resolve_params:
+        with timing.track("参数解析LLM"):
+            results = await asyncio.gather(*(_resolve_param(p) for p in resolve_params))
+        last_ctx = _NO_CTX
+        for param_name, value, ctx in results:
+            if value:
+                tool_inputs[param_name] = value
+            if ctx is not _NO_CTX:
+                last_ctx = ctx
+        # 保持原语义：context 重绑定为最后一次非 file 参数获取的 Redis 上下文
+        # （即使为 None，也走原"无结构化上下文"路径；供缺参占位判断使用）
+        if last_ctx is not _NO_CTX:
+            context = last_ctx
 
     # 规范化参数值（JSON对象 → 坐标、数字等），再做缺失检查
     if input_schema:
@@ -1153,7 +1180,8 @@ async def execute_tool_action(action: dict, context: dict) -> dict:
         sys.stderr.write(f"[ToolExecutor] 执行工具 {tool_name}，参数: {tool_inputs}\n")
         sys.stderr.flush()
         
-        result = await tool.ainvoke(tool_inputs)
+        with timing.track(f"工具调用[{tool_name}]"):
+            result = await tool.ainvoke(tool_inputs)
         result_text = str(result)
         sys.stderr.write(f"[ToolExecutor] tool.ainvoke 返回: {result_text[:500]}\n")
         sys.stderr.flush()

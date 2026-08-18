@@ -44,11 +44,11 @@ def build_coordinator_graph(deps: Deps):
     def _router(s):
         return coordinator_router_node(s, deps)
     
-    def _collector(s):
-        return parameter_collector_node(s, deps)
+    async def _collector(s):
+        return await parameter_collector_node(s, deps)
     
-    def _decomposer(s):
-        return task_decomposer_node(s, deps)
+    async def _decomposer(s):
+        return await task_decomposer_node(s, deps)
     
     def _allocator(s):
         return task_allocator_node(s, deps)

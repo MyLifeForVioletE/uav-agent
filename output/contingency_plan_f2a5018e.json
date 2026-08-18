@@ -3,9 +3,9 @@
         {
             "step": 1,
             "action_id": "action_1",
-            "action_name": "规划飞抵航线",
+            "action_name": "规划航线",
             "tool_name": "path_planning",
-            "goal": "以UAV_1的当前位置为起点，以目标T1的位置坐标为终点，生成飞行航线",
+            "goal": "以UAV_2的当前位置为起点，以目标70,15.02的位置坐标为终点，规划航线",
             "contingency": [
                 {
                     "condition": "规划失败",
@@ -14,25 +14,20 @@
                 },
                 {
                     "condition": "目标位置变更",
-                    "action_id": "action_4",
-                    "action_name": "规划返航航线"
+                    "action_id": "action_1",
+                    "action_name": "规划航线"
                 }
             ]
         },
         {
             "step": 2,
             "action_id": "action_2",
-            "action_name": "沿航线飞抵目标",
+            "action_name": "沿航线飞行",
             "tool_name": "flight",
-            "goal": "以规划航线的航迹点为路径，从当前位置飞行至目标T1位置",
+            "goal": "以UAV_2的当前位置为起点，以目标70,15.02的位置坐标为终点，沿航线飞行",
             "contingency": [
                 {
                     "condition": "航向偏移过大或遇障",
-                    "action_id": "action_4",
-                    "action_name": "规划返航航线"
-                },
-                {
-                    "condition": "任务取消且不在起点",
                     "action_id": "action_5",
                     "action_name": "沿航线返航"
                 }
@@ -43,17 +38,12 @@
             "action_id": "action_3",
             "action_name": "执行扫频侦察",
             "tool_name": "sweepFrequencyReconnaissance",
-            "goal": "以UAV_1的当前位置为基准，获取目标T1处的电磁频谱扫描数据",
+            "goal": "以UAV_2的当前位置为起始点，以目标T1的位置坐标为扫描区域，执行扫频侦察",
             "contingency": [
                 {
                     "condition": "扫频失败但信息不足",
                     "action_id": "action_4",
                     "action_name": "规划返航航线"
-                },
-                {
-                    "condition": "扫频失败但信息充足",
-                    "action_id": "action_3",
-                    "action_name": "执行扫频侦察"
                 }
             ]
         },
@@ -62,17 +52,12 @@
             "action_id": "action_4",
             "action_name": "规划返航航线",
             "tool_name": "path_planning",
-            "goal": "以UAV_1的当前位置（目标T1坐标）为起点，以基地起飞点坐标为终点，生成返航航线",
+            "goal": "以UAV_2的当前位置为起点，以基地70,15的起飞点坐标为终点，规划返航航线",
             "contingency": [
                 {
                     "condition": "规划失败",
-                    "action_id": "action_4",
-                    "action_name": "规划返航航线"
-                },
-                {
-                    "condition": "目标位置不可达",
-                    "action_id": "land",
-                    "action_name": "降落"
+                    "action_id": "end",
+                    "action_name": "结束"
                 }
             ]
         },
@@ -81,15 +66,10 @@
             "action_id": "action_5",
             "action_name": "沿航线返航",
             "tool_name": "flight",
-            "goal": "以规划航线的航迹点为路径，从当前位置飞回基地起飞点",
+            "goal": "以UAV_2的当前位置为起点，沿规划航线飞回基地70,15",
             "contingency": [
                 {
-                    "condition": "航向偏移过大或遇障",
-                    "action_id": "action_4",
-                    "action_name": "规划返航航线"
-                },
-                {
-                    "condition": "任务取消且不在起点",
+                    "condition": "返航遇障",
                     "action_id": "land",
                     "action_name": "降落"
                 }

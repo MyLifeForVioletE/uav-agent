@@ -1,15 +1,14 @@
 """router 节点：LLM 意图分类与路由分派"""
 import sys
 
-import requests
 from langchain_core.messages import SystemMessage
 
-from core.config import OLLAMA_BASE, MODEL
+from core.ollama_utils import achat_ollama
 from core.state import AgentState, Deps
 from core.prompts import load_skill
 
 
-def router_node(state: AgentState, deps: Deps = None) -> AgentState:
+async def router_node(state: AgentState, deps: Deps = None) -> AgentState:
     """router 节点：LLM 纯意图分类，按管道分派到不同业务节点"""
     uid = state.get("user_input", "")
     uid = uid or state.get("_last_input", "")
@@ -20,20 +19,14 @@ def router_node(state: AgentState, deps: Deps = None) -> AgentState:
     # 已生成宏观规划但未确认 → 检测确认/修改意图
     if state.get("plan_generated") and not state.get("macro_plan_confirmed"):
         try:
-            resp = requests.post(
-                f"{OLLAMA_BASE}/api/chat",
-                json={
-                    "model": MODEL,
-                    "messages": [
-                        {"role": "system", "content": "判断用户是否在确认、同意之前给出的规划方案。只回答 CONFIRM 或 OTHER。"},
-                        {"role": "user", "content": uid},
-                    ],
-                    "stream": False,
-                    "options": {"temperature": 0},
-                },
-                timeout=30,
+            o_msg = await achat_ollama(
+                [
+                    {"role": "system", "content": "判断用户是否在确认、同意之前给出的规划方案。只回答 CONFIRM 或 OTHER。"},
+                    {"role": "user", "content": uid},
+                ],
+                temperature=0, timeout=30,
             )
-            is_confirm = resp.json()["message"]["content"].strip().upper() == "CONFIRM"
+            is_confirm = o_msg.get("content", "").strip().upper() == "CONFIRM"
             sys.stderr.write(f"[Router] confirm={is_confirm}\n"); sys.stderr.flush()
             state["_intent"] = "confirm" if is_confirm else "planning"
         except Exception as e:
@@ -44,20 +37,14 @@ def router_node(state: AgentState, deps: Deps = None) -> AgentState:
     # 详细规划已生成但未确认 → 检测确认/修改意图
     if state.get("detail_plan_done") and not state.get("detail_plan_confirmed"):
         try:
-            resp = requests.post(
-                f"{OLLAMA_BASE}/api/chat",
-                json={
-                    "model": MODEL,
-                    "messages": [
-                        {"role": "system", "content": "判断用户是否在确认、同意之前给出的详细规划方案。只回答 CONFIRM 或 OTHER。"},
-                        {"role": "user", "content": uid},
-                    ],
-                    "stream": False,
-                    "options": {"temperature": 0},
-                },
-                timeout=30,
+            o_msg = await achat_ollama(
+                [
+                    {"role": "system", "content": "判断用户是否在确认、同意之前给出的详细规划方案。只回答 CONFIRM 或 OTHER。"},
+                    {"role": "user", "content": uid},
+                ],
+                temperature=0, timeout=30,
             )
-            is_confirm = resp.json()["message"]["content"].strip().upper() == "CONFIRM"
+            is_confirm = o_msg.get("content", "").strip().upper() == "CONFIRM"
             sys.stderr.write(f"[Router] detail_confirm={is_confirm}\n"); sys.stderr.flush()
             if is_confirm:
                 state["detail_plan_confirmed"] = True

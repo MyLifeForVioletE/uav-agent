@@ -2,12 +2,10 @@
 import json
 import sys
 
-import requests
 from langchain_core.messages import HumanMessage, AIMessage
 
-from core.config import OLLAMA_BASE, MODEL
 from core.state import AgentState, Deps
-from core.ollama_utils import messages_to_ollama, tools_to_ollama
+from core.ollama_utils import messages_to_ollama, tools_to_ollama, achat_ollama
 from agent.nodes.planning import _extract_json
 
 
@@ -38,22 +36,7 @@ async def call_llm(state: AgentState, deps: Deps) -> AgentState:
     while True:
         attempt += 1
         try:
-            body = {
-                "model": MODEL,
-                "messages": o_messages,
-                "stream": False,
-                "options": {"temperature": 0, "num_predict": 4096},
-            }
-            if o_tools:
-                body["tools"] = o_tools
-            resp = requests.post(
-                f"{OLLAMA_BASE}/api/chat",
-                json=body,
-                timeout=120,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            o_msg = data.get("message", {})
+            o_msg = await achat_ollama(o_messages, tools=o_tools or None)
             content = o_msg.get("content", "")
             o_tcs = o_msg.get("tool_calls", [])
         except Exception as e:
@@ -162,7 +145,7 @@ async def call_llm(state: AgentState, deps: Deps) -> AgentState:
             state["detail_plan_done"] = True
             # 完整详细规划生成后：基于全部动作列表统一生成各动作的异常应对措施（contingency）
             from agent.nodes.planning import _run_contingency_pass
-            _run_contingency_pass(state, deps)
+            await _run_contingency_pass(state, deps)
             # 整合输出全部阶段的原子动作
             all_actions = state.get("detail_actions", [])
             consolidated = {"actions": all_actions}
@@ -183,7 +166,7 @@ async def call_llm(state: AgentState, deps: Deps) -> AgentState:
             # 重规划替换了全部动作：重置标记并基于新计划重新生成 contingency
             state["_contingency_generated"] = False
             from agent.nodes.planning import _run_contingency_pass
-            _run_contingency_pass(state, deps)
+            await _run_contingency_pass(state, deps)
             consolidated = json.dumps({"actions": data["actions"]}, ensure_ascii=False, indent=4)
             summary = f"已根据修改意见重新规划，共 {len(data['actions'])} 个原子动作：\n\n```json\n{consolidated}\n```\n\n请确认新的详细规划方案。"
             state["output"] = summary

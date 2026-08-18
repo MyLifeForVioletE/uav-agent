@@ -13,6 +13,7 @@ from core.redis_manager import RedisManager
 from core.ollama_utils import filter_tools_for_role
 from core.config import COORDINATOR_ID
 from core.kafka_bus import get_kafka_bus, new_msg_id
+from core.timing import timing
 from agent.graph import build_graph
 from agent.analyst_graph import build_analyst_graph
 
@@ -282,8 +283,9 @@ class SubAgent:
         # 分析 agent：直接跑一次分析图即完成（无规划/无用户确认）
         if self.mode == "processor":
             try:
-                self.state = await self.graph.ainvoke(self.state, {"recursion_limit": 50})
-                self.last_output = self.state.get("output", "")
+                with timing.track("分析图(processor)"):
+                    self.state = await self.graph.ainvoke(self.state, {"recursion_limit": 50})
+                    self.last_output = self.state.get("output", "")
                 # 缺参挂起：execute_tools 置 _analyst_param_pending，这里上报指挥并挂起等待
                 pending = self.state.get("_analyst_param_pending")
                 if pending and not self._awaiting_reply:
@@ -315,14 +317,16 @@ class SubAgent:
         if (self.state.get("detail_plan_confirmed") and self.state.get("detail_actions")
                 and self.state.get("plan_generated") and self.state.get("macro_plan_confirmed")
                 and not self.state.get("pending_question")):
-            await self._execute_saved_action_step()
+            with timing.track("执行动作"):
+                await self._execute_saved_action_step()
             return
 
         was_pg = self.state.get("plan_generated", False)
 
         try:
-            self.state = await self.graph.ainvoke(self.state, {"recursion_limit": 50})
-            self.last_output = self.state.get("output", "")
+            with timing.track("规划图"):
+                self.state = await self.graph.ainvoke(self.state, {"recursion_limit": 50})
+                self.last_output = self.state.get("output", "")
             self._sync_status()
             # 向指挥上报已生成的宏观/详细规划
             await self._report_plans_if_ready()

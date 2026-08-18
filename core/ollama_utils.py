@@ -2,7 +2,34 @@
 import json
 from pathlib import Path
 
-from core.config import BASE_DIR
+from core.config import BASE_DIR, OLLAMA_BASE, MODEL
+
+
+async def achat_ollama(messages: list, *, model: str = MODEL, tools: list = None,
+                       temperature: float = 0, num_predict: int = 4096,
+                       timeout: float = 120.0) -> dict:
+    """异步调用 Ollama /api/chat（非流式）：把同步 requests.post 放入线程池执行。
+
+    多 agent 并行（asyncio.gather）时，若在事件循环里直接发起同步 HTTP 请求，
+    单个 agent 的 LLM 调用会阻塞整个循环，其它 agent 全部被卡死。
+    放入线程池后阻塞只发生在 worker 线程，事件循环可继续调度其它 agent。
+    返回响应中的 message dict（含 content / tool_calls）。
+    """
+    import asyncio
+    import requests
+    body = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": {"temperature": temperature, "num_predict": num_predict},
+    }
+    if tools:
+        body["tools"] = tools
+    resp = await asyncio.to_thread(
+        requests.post, f"{OLLAMA_BASE}/api/chat", json=body, timeout=timeout
+    )
+    resp.raise_for_status()
+    return resp.json().get("message", {})
 
 
 def messages_to_ollama(messages: list) -> list:

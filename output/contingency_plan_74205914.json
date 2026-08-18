@@ -1,0 +1,42 @@
+{
+    "plan": [
+        {
+            "step": 2,
+            "action_id": "action_2",
+            "action_name": "沿航线飞抵目标",
+            "tool_name": "flight",
+            "goal": "以UAV_1的当前位置为起点，沿预规划航线飞行至目标T1位置",
+            "contingency": [
+                {
+                    "condition": "航向偏移过大或遇障",
+                    "action_id": "",
+                    "action_name": "规划返航航线"
+                },
+                {
+                    "condition": "飞行失败",
+                    "action_id": "land",
+                    "action_name": "降落"
+                }
+            ]
+        },
+        {
+            "step": 3,
+            "action_id": "action_1",
+            "action_name": "执行扫频侦察",
+            "tool_name": "sweepFrequencyReconnaissance",
+            "goal": "以UAV_1的当前位置为起点，以目标T1的位置坐标为终点，执行扫频侦察",
+            "contingency": [
+                {
+                    "condition": "扫频失败但信息不足",
+                    "action_id": "",
+                    "action_name": "规划返航航线"
+                },
+                {
+                    "condition": "扫频数据不完整",
+                    "action_id": "action_1",
+                    "action_name": "执行扫频侦察"
+                }
+            ]
+        }
+    ]
+}

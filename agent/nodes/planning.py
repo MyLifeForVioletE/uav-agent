@@ -1,4 +1,5 @@
 """planning_prep 节点：RAG 上下文注入（宏观/详细规划）"""
+import asyncio
 import json
 import re
 import sys
@@ -6,7 +7,8 @@ from pathlib import Path
 
 from langchain_core.messages import SystemMessage, AIMessage
 
-from core.config import OLLAMA_BASE, MODEL, BASE_DIR
+from core.config import BASE_DIR
+from core.ollama_utils import achat_ollama
 from core.state import AgentState, Deps
 
 
@@ -180,11 +182,11 @@ def _load_detail_context(deps: Deps) -> list[str]:
     return parts
 
 
-def _inject_rag_context(deps: Deps, original: str, phase_name: str, parts: list[str]) -> None:
-    """检索阶段分解 RAG 并追加到 parts"""
+async def _inject_rag_context(deps: Deps, original: str, phase_name: str, parts: list[str]) -> None:
+    """检索阶段分解 RAG 并追加到 parts（同步 RAG 放入线程池，避免阻塞事件循环）"""
     try:
         query = f"{original} {phase_name}"
-        context, phases = deps.detail_planner.plan(query)
+        context, phases = await asyncio.to_thread(deps.detail_planner.plan, query)
         if context:
             parts.append(context)
         sys.stderr.write(f"[RAG] 阶段分解检索({phase_name}): {len(context)}字\n"); sys.stderr.flush()
@@ -206,8 +208,11 @@ def _build_phase_prompt(parts: list[str], phase: dict, original: str) -> str:
     return phase_block
 
 
-def planning_prep(state: AgentState, deps: Deps = None) -> AgentState:
-    """planning_prep 节点：注入 RAG 上下文（宏观规划检索 / 详细规划逐阶段注入）"""
+async def planning_prep(state: AgentState, deps: Deps = None) -> AgentState:
+    """planning_prep 节点：注入 RAG 上下文（宏观规划检索 / 详细规划逐阶段注入）
+
+    内部同步 RAG（chromadb + embedding HTTP）放入线程池，避免多 agent 并行时互相阻塞。
+    """
     uid = state.get("user_input", "") or state.get("_last_input", "")
 
     # ── 宏观规划阶段（plan_generated=False）──
@@ -224,12 +229,16 @@ def planning_prep(state: AgentState, deps: Deps = None) -> AgentState:
 
         # RAG 检索场景参考 + 约束条件
         try:
-            scenario_context, scenario_phases = deps.macro_planner.plan(uid, retrieve_k=3, rerank_n=2)
+            scenario_context, scenario_phases = await asyncio.to_thread(
+                deps.macro_planner.plan, uid, 3, 2
+            )
             sys.stderr.write(f"[RAG] 场景检索: {len(scenario_context)}字, phases={scenario_phases}\n"); sys.stderr.flush()
         except Exception as e2:
             sys.stderr.write(f"[RAG] 场景检索异常: {e2}\n"); sys.stderr.flush()
         try:
-            constraint_context, _ = deps.constraint_planner.plan(uid, score_threshold=0.4)
+            constraint_context, _ = await asyncio.to_thread(
+                deps.constraint_planner.plan, uid, None, None, 0.4
+            )
             constraint_srcs = [ln.split("来源: ", 1)[1] for ln in constraint_context.split("\n") if "来源: " in ln]
             sys.stderr.write(f"[RAG] 约束检索: {len(constraint_context)}字, 来源: {constraint_srcs}\n"); sys.stderr.flush()
         except Exception as e2:
@@ -286,7 +295,7 @@ def planning_prep(state: AgentState, deps: Deps = None) -> AgentState:
 
         # 加载通用知识库上下文 + RAG
         parts = _load_detail_context(deps)
-        _inject_rag_context(deps, original, macro_phases[0].get("phase_name", ""), parts)
+        await _inject_rag_context(deps, original, macro_phases[0].get("phase_name", ""), parts)
 
         # 构造第一阶段 prompt
         state["user_input"] = _build_phase_prompt(parts, macro_phases[0], original)
@@ -303,7 +312,7 @@ def planning_prep(state: AgentState, deps: Deps = None) -> AgentState:
             original = state.get("original_scenario", uid)
 
             parts = _load_detail_context(deps)
-            _inject_rag_context(deps, original, phases[idx + 1].get("phase_name", ""), parts)
+            await _inject_rag_context(deps, original, phases[idx + 1].get("phase_name", ""), parts)
 
             state["user_input"] = _build_phase_prompt(parts, phases[idx + 1], original)
             sys.stderr.write(f"[Planning] 注入阶段 {idx + 2}/{len(phases)}: {phases[idx + 1].get('phase_name','')}\n"); sys.stderr.flush()
@@ -373,39 +382,36 @@ def _merge_contingency_results(actions: list, cons: list) -> int:
     return merged
 
 
-def _run_contingency_pass(state: AgentState, deps: Deps = None) -> AgentState:
+async def _run_contingency_pass(state: AgentState, deps: Deps = None) -> AgentState:
     """完整详细规划生成后，基于全部动作列表统一生成每个动作的 contingency（只跑一次）。
 
     LLM 调用失败/解析失败时静默降级（不生成 contingency），不影响规划主流程。
+    LLM 调用经 achat_ollama 放入线程池，避免阻塞多 agent 并行的事件循环。
     """
     if state.get("_contingency_generated"):
         return state
     actions = state.get("detail_actions", [])
     if not actions:
         return state
-    import requests
     prompt = _build_contingency_prompt(actions)
     # 追加参考场景（phase_decmposition 场景文档中 contingency 的写法供参照）
     if deps is not None:
         try:
             original = state.get("original_scenario") or ""
             if original:
-                scenario_context, _ = deps.detail_planner.plan(original, retrieve_k=2, rerank_n=1)
+                scenario_context, _ = await asyncio.to_thread(
+                    deps.detail_planner.plan, original, 2, 1
+                )
                 if scenario_context:
                     prompt += "\n\n【参考场景（异常应对写法参照此文档，但 action_name 仍须按上面动作列表引用）】\n" + scenario_context[:2000]
         except Exception as e:
             sys.stderr.write(f"[Planning] contingency RAG 参考检索失败: {e}\n"); sys.stderr.flush()
     content = ""
     try:
-        body = {
-            "model": MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-            "options": {"temperature": 0, "num_predict": 4096},
-        }
-        resp = requests.post(f"{OLLAMA_BASE}/api/chat", json=body, timeout=120)
-        resp.raise_for_status()
-        content = resp.json().get("message", {}).get("content", "")
+        o_msg = await achat_ollama(
+            [{"role": "user", "content": prompt}], num_predict=4096
+        )
+        content = o_msg.get("content", "")
     except Exception as e:
         sys.stderr.write(f"[Planning] contingency 生成调用失败: {e}\n"); sys.stderr.flush()
         state["_contingency_generated"] = True

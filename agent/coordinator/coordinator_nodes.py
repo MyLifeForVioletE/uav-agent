@@ -13,14 +13,15 @@ import json
 import re
 import sys
 import uuid
-import requests
 
 from core.state import AgentState, Deps
-from core.config import OLLAMA_BASE, MODEL, BASE_DIR
+from core.config import BASE_DIR
 from core.fleet_config import (
     SubTask, UAVConfig, UAVRole, generate_fleet_id,
 )
+from core.ollama_utils import achat_ollama
 from core.redis_manager import get_redis_manager
+from core.timing import timing
 from fleet.fleet_manager import FleetManager
 
 
@@ -97,7 +98,7 @@ def coordinator_router_node(state: AgentState, deps: Deps) -> AgentState:
     return state
 
 
-def parameter_collector_node(state: AgentState, deps: Deps) -> AgentState:
+async def parameter_collector_node(state: AgentState, deps: Deps) -> AgentState:
     """
     参数收集节点：
     - 询问用户是否还有信息要补充
@@ -174,7 +175,8 @@ def parameter_collector_node(state: AgentState, deps: Deps) -> AgentState:
 只输出 JSON 对象，不要输出其他内容。"""
     
     try:
-        response = deps.llm_no_tools.invoke([HumanMessage(content=extract_prompt)])
+        with timing.track("参数收集LLM"):
+            response = await deps.llm_no_tools.ainvoke([HumanMessage(content=extract_prompt)])
         raw = response.content.strip()
         
         # 提取 JSON 部分
@@ -223,7 +225,7 @@ def parameter_collector_node(state: AgentState, deps: Deps) -> AgentState:
     return state
 
 
-def task_decomposer_node(state: AgentState, deps: Deps) -> AgentState:
+async def task_decomposer_node(state: AgentState, deps: Deps) -> AgentState:
     """
     子任务分解节点：
     - 基于用户的多机任务描述 + 已解析的 Redis 上下文
@@ -260,7 +262,8 @@ def task_decomposer_node(state: AgentState, deps: Deps) -> AgentState:
     ref_text = ""
     if deps.decomposer_planner:
         try:
-            contexts, _ = deps.decomposer_planner.plan(uid, retrieve_k=5, rerank_n=1)
+            with timing.track("任务分解RAG检索"):
+                contexts, _ = deps.decomposer_planner.plan(uid, retrieve_k=5, rerank_n=1)
             if contexts:
                 ref_text = f"\n【参考类似场景的任务分解】\n{contexts}\n"
         except Exception:
@@ -348,20 +351,11 @@ assigned_uav_role 必须与用户说的无人机类型一致。
 只返回JSON，不要其他内容。"""
     
     try:
-        resp = requests.post(
-            f"{OLLAMA_BASE}/api/chat",
-            json={
-                "model": MODEL,
-                "messages": [
-                    {"role": "user", "content": prompt},
-                ],
-                "stream": False,
-                "options": {"temperature": 0, "num_predict": 4096},
-            },
-            timeout=120,
-        )
-        resp.raise_for_status()
-        content = resp.json()["message"]["content"]
+        with timing.track("任务分解LLM"):
+            o_msg = await achat_ollama(
+                [{"role": "user", "content": prompt}], num_predict=4096
+            )
+        content = o_msg.get("content", "")
         
         # 解析JSON
         print(f"[DEBUG] decomposer LLM raw output:\n{content[:2000]}", file=sys.stderr, flush=True)
@@ -694,6 +688,13 @@ def result_aggregator_node(state: AgentState, deps: Deps) -> AgentState:
     if fleet_mgr:
         results = fleet_mgr.get_aggregated_results(state)
         state["output"] = "[ResultAggregator] 舰队任务执行完成"
+        # 任务完成：输出耗时报告并重置（启动初始化耗时保留）
+        try:
+            print(timing.format_report(), file=sys.stderr, flush=True)
+            timing.reset()
+        except Exception as e:
+            sys.stderr.write(f"[ResultAggregator] 耗时报告输出失败: {e}\n")
+            sys.stderr.flush()
     else:
         state["output"] = "[ResultAggregator] 无法获取Fleet管理器"
     

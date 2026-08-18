@@ -1,6 +1,7 @@
 """主入口：MCP 连接 → 工具注册 → RAG 初始化 → 图构建 → 交互循环"""
 import asyncio
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from core.config import OLLAMA_BASE, MODEL, BASE_DIR
 from core.state import AgentState, Deps, default_agent_state
 from core.prompts import SYSTEM_PROMPT
 from core.redis_manager import get_redis_manager
+from core.timing import timing
 from agent.coordinator import build_coordinator_graph
 from rag import TaskPlanner
 from tools.stub_tools import merge_stub_tools
@@ -22,6 +24,7 @@ async def main():
     """主入口：启动 MCP 客户端 → 注册工具 → 构建图 → 进入交互循环。"""
     # 初始化 Redis 管理器
     redis_mgr = get_redis_manager()
+    _t0 = time.perf_counter()
     
     # 生成会话ID
     session_id = str(uuid.uuid4())[:8]
@@ -89,6 +92,7 @@ async def main():
         tool_map = {t.name: t for t in all_tools}
         llm_plain = ChatOllama(model=MODEL, temperature=0, base_url=OLLAMA_BASE, request_timeout=60)
         deps = Deps(tools=tool_map, llm_no_tools=llm_plain, macro_planner=macro_planner, constraint_planner=constraint_planner, detail_planner=detail_planner, decomposer_planner=decomposer_planner)
+        timing.init_time = time.perf_counter() - _t0
         
         # 构建 Coordinator 图（入口）；子 agent 内部复用 agent/graph.py 执行图
         coordinator_graph = build_coordinator_graph(deps)
@@ -114,7 +118,9 @@ async def main():
                 # 追加用户消息到 Redis
                 redis_mgr.append_message(session_id, {"type": "human", "content": user_input})
                 
+                _t1 = time.perf_counter()
                 state = await coordinator_graph.ainvoke(state)
+                timing.exec_wall += time.perf_counter() - _t1
                 state["user_input"] = ""
                 out = state.get("output", "")
                 pq = state.get("pending_question", "")
@@ -137,9 +143,12 @@ async def main():
                 print(f"\n{pq}", flush=True)
 
             # 读取用户输入
+            _t2 = time.perf_counter()
             uid = await asyncio.to_thread(input, "\n>>> ")
+            timing.user_wait += time.perf_counter() - _t2
             uid = uid.strip()
             if uid.lower() == "exit":
+                print(timing.format_report(), flush=True)
                 break
             
             # 如果有待确认问题，用户的输入是确认，清除 pending_question
