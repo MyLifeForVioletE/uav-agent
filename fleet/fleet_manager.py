@@ -321,23 +321,14 @@ class FleetManager:
                     payload={"kind": "algorithm", "action": action})
                 return
 
-        # 推导失败/无 LLM/超限 → 询问用户：先结束当前脚本段，恢复后另起新段
+        # 推导失败/无 LLM/超限 → 跳过该动作（不再询问用户）
         param_desc = "、".join(f"{p.get('name', '')}({p.get('description', '')})" for p in missing)
-        self._finalize_script_segment(state, f"缺参暂停：{tool_name} 需要 {param_desc}，等待用户提供")
-        state["_awaiting_user_param"] = {
-            "agent_id": from_id,
-            "task_id": task_id,
-            "tool_name": tool_name,
-            "params": missing,
-            "correlation_id": correlation_id,
-        }
-        state["_sub_awaiting"] = task_id
-        question = (f"无人机 {from_id} 执行动作「{payload.get('action_name', '')}」需要参数 {param_desc}，"
-                    f"指挥无法从现有信息推导。\n请提供该参数的值（如坐标格式 70,15.01）。")
-        state["pending_question"] = question
-        state["output"] = question
-        sys.stderr.write(f"[Fleet] 缺参推导失败/超限，询问用户: {question[:120]}\n")
+        sys.stderr.write(f"[Fleet] 缺参推导失败/超限，跳过动作: {tool_name} 缺 {param_desc}\n")
         sys.stderr.flush()
+        await self._send_reply(state, from_id,
+            f"参数 {param_desc} 无法从现有信息推导，已跳过该动作。",
+            correlation_id,
+            payload={"kind": "param_failed", "params": [p.get("name", "") for p in missing]})
 
     async def _try_dispatch_dependency_producer(self, state: AgentState, msg: dict,
                                                 missing: list, from_id: str,
@@ -570,52 +561,22 @@ class FleetManager:
         sys.stderr.flush()
 
     async def _handle_plan_confirm_request(self, state: AgentState, msg: dict):
-        """规划确认请示：子 agent 的宏观/详细规划已产出，转达用户确认。
-
-        多槽位：按 agent_id 独立保存，多架无人机的确认请求不会互相覆盖；
-        用户确认后由 _handle_user_plan_confirm 按各自 correlation_id 回发 reply。
-        """
+        """规划确认请示：子 agent 的宏观/详细规划已产出，自动确认（不再询问用户）"""
         payload = msg.get("payload") or {}
         from_id = msg.get("from", "")
         task_id = payload.get("task_id", "")
         task_name = payload.get("task_name", "")
         plan_type = payload.get("plan_type", "macro_plan")
-        plan_data = payload.get("plan_data", []) or []
         correlation_id = msg.get("correlation_id")
 
-        # 展示方案内容
-        plan_text = ""
-        if plan_type == "detail_plan":
-            for i, a in enumerate(plan_data, 1):
-                plan_text += f"{i}. {a.get('action_name', '')}\n"
-                for c in (a.get("contingency") or []):
-                    if not isinstance(c, dict):
-                        continue
-                    plan_text += f"   - 若{c.get('condition', '')} → 切换至「{c.get('action_name', '')}」\n"
-        else:
-            for p in plan_data:
-                plan_text += f"- {p.get('phase_name', p.get('phase_id', ''))}\n"
         label = "详细规划" if plan_type == "detail_plan" else "宏观规划"
-
-        awaiting = state.setdefault("_awaiting_user_confirm", {})
-        awaiting[from_id] = {
-            "agent_id": from_id,
-            "task_id": task_id,
-            "task_name": task_name,
-            "correlation_id": correlation_id,
-            "plan_type": plan_type,
-            "label": label,
-            "plan_text": plan_text,
-        }
-        state["_sub_awaiting"] = task_id
-        question = self._build_confirm_question(state)
-        state["pending_question"] = question
-        state["output"] = question
-        sys.stderr.write(
-            f"[Fleet] {from_id} 的{label}待用户确认: {task_id}"
-            f"（当前共 {len(awaiting)} 个待确认，按到达顺序逐个确认）\n"
-        )
+        sys.stderr.write(f"[Fleet] {from_id} 的{label}已自动确认: {task_id}\n")
         sys.stderr.flush()
+
+        await self._send_reply(state, from_id,
+            f"{label}方案已确认，继续执行。",
+            correlation_id,
+            payload={"kind": "user_confirm", "plan_type": plan_type})
 
     def _build_confirm_question(self, state: AgentState) -> str:
         """返回队首（最先到达）的待确认规划方案问题；其余待确认的排队等待，不合并展示"""
@@ -889,7 +850,6 @@ class FleetManager:
         # 安全限制：防止无限循环
         tick_count = state.setdefault("_fleet_tick_count", 0) + 1
         state["_fleet_tick_count"] = tick_count
-        print(f"[DEBUG tick #{tick_count}] all_done={state.get('_fleet_all_done')} sub_awaiting={state.get('_sub_awaiting','')}", file=sys.stderr, flush=True)
         if tick_count > 200:
             state["_fleet_all_done"] = True
             state["output"] = "[Fleet] 超过最大 tick 次数，强制结束"

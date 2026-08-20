@@ -6,10 +6,6 @@ from core.state import AgentState
 
 def route_coordinator_idle(state: AgentState) -> str:
     """idle → 根据意图分派"""
-    # 有 pending_question 则等待用户确认，图结束
-    if state.get("pending_question"):
-        return END
-    
     intent = state.get("_coordinator_intent", "")
     
     # 用户确认后继续下一步
@@ -26,27 +22,19 @@ def route_coordinator_idle(state: AgentState) -> str:
 
 
 def route_after_collect(state: AgentState) -> str:
-    """parameter_collector → 有pending_question则idle等确认，否则task_decomposer"""
-    if state.get("pending_question"):
-        return "idle"
+    """parameter_collector → 始终去 task_decomposer"""
     return "task_decomposer"
 
 
 def route_after_decompose(state: AgentState) -> str:
-    """task_decomposer → 有pending_question则idle等确认，否则task_allocator"""
-    pq = state.get("pending_question")
-    print(f"[DEBUG] route_after_decompose: pending_question={pq!r} sub_tasks={len(state.get('sub_tasks', []))}", file=sys.stderr, flush=True)
-    if pq:
-        return "idle"
+    """task_decomposer → 有sub_tasks则task_allocator，否则END"""
     if not state.get("sub_tasks"):
         return END
     return "task_allocator"
 
 
 def route_after_allocate(state: AgentState) -> str:
-    """task_allocator → 有pending_question则idle等确认，否则fleet_dispatcher"""
-    if state.get("pending_question"):
-        return "idle"
+    """task_allocator → 始终去 fleet_dispatcher"""
     return "fleet_dispatcher"
 
 

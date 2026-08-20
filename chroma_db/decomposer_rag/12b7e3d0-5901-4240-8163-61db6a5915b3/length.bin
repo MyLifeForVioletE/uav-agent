@@ -1,1 +1,0 @@
-invalid type: string "## 子任务分解\n\n```json\n{\n    \"scenario\": \"两架无人机到两个位置侦查一个敌方目标，然后计算出最佳干扰位置，对敌方目标进行干扰\",\n    \"uav_count\": 2,\n    \"sub_tasks\": [\n        {\n            \"task_id\": \"T1\",\n            \"task_name\": \"无人机对位置1执行扫频侦察\",\n            \"goal\": \"L������������

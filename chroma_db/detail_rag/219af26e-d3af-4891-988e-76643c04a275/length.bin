@@ -1,0 +1,1 @@
+invalid type: string "## 阶段4:任务完成返航\n- 生成从当前位置到基地的航线\n    - executor: tool\n    - tool_name: path_planning\n    - goal: \"以无人机当前位置为起点，以基地起飞点为终点，规划返航航线\"\n    - contingency:\n        - condition: \"规划失败\"\n          action_name: \"降落\"\n- 无人机沿航线折返\n    - executor: tool\non: 

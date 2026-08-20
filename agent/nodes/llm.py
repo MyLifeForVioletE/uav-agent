@@ -143,6 +143,7 @@ async def call_llm(state: AgentState, deps: Deps) -> AgentState:
         idx = state.get("current_phase_idx", 0)
         if phases and idx >= len(phases) - 1:
             state["detail_plan_done"] = True
+            state["detail_plan_confirmed"] = True
             # 完整详细规划生成后：基于全部动作列表统一生成各动作的异常应对措施（contingency）
             from agent.nodes.planning import _run_contingency_pass
             await _run_contingency_pass(state, deps)
@@ -150,9 +151,9 @@ async def call_llm(state: AgentState, deps: Deps) -> AgentState:
             all_actions = state.get("detail_actions", [])
             consolidated = {"actions": all_actions}
             consolidated_text = json.dumps(consolidated, ensure_ascii=False, indent=4)
-            summary = f"全部 {len(phases)} 个阶段拆解完毕，共 {len(all_actions)} 个原子动作：\n\n```json\n{consolidated_text}\n```\n\n是否确认以上详细规划方案？"
+            summary = f"全部 {len(phases)} 个阶段拆解完毕，共 {len(all_actions)} 个原子动作：\n\n```json\n{consolidated_text}\n```"
             state["output"] = summary
-            state["pending_question"] = summary
+            state["pending_question"] = ""
             sys.stderr.write(f"[LLM] 所有 {len(phases)} 个阶段拆解完毕，总计 {len(all_actions)} 个原子动作\n"); sys.stderr.flush()
 
     # 用户修改意见后的单次重规划：解析新动作列表
@@ -163,19 +164,21 @@ async def call_llm(state: AgentState, deps: Deps) -> AgentState:
         if actions:
             state["detail_actions"] = actions
             state["detail_plan_done"] = True
+            state["detail_plan_confirmed"] = True
             # 重规划替换了全部动作：重置标记并基于新计划重新生成 contingency
             state["_contingency_generated"] = False
             from agent.nodes.planning import _run_contingency_pass
             await _run_contingency_pass(state, deps)
             consolidated = json.dumps({"actions": data["actions"]}, ensure_ascii=False, indent=4)
-            summary = f"已根据修改意见重新规划，共 {len(data['actions'])} 个原子动作：\n\n```json\n{consolidated}\n```\n\n请确认新的详细规划方案。"
+            summary = f"已根据修改意见重新规划，共 {len(data['actions'])} 个原子动作：\n\n```json\n{consolidated}\n```"
             state["output"] = summary
-            state["pending_question"] = summary
+            state["pending_question"] = ""
             sys.stderr.write(f"[LLM] 修改意见重规划完成，共 {len(data['actions'])} 个原子动作\n"); sys.stderr.flush()
         else:
             # 重规划失败：沿用原方案，避免挂起
             sys.stderr.write("[LLM] 修改意见重规划响应未包含有效 actions，沿用原方案\n"); sys.stderr.flush()
             state["detail_plan_done"] = True
-            state["pending_question"] = content or "重新规划未生成有效结果，请确认原方案或再次提出修改。"
+            state["detail_plan_confirmed"] = True
+            state["pending_question"] = ""
 
     return state

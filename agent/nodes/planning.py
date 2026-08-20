@@ -276,8 +276,8 @@ async def planning_prep(state: AgentState, deps: Deps = None) -> AgentState:
         )
         sys.stderr.write(f"[Planning] 用户修改详细规划：旧动作 {len(old_actions)} 个，意见: {feedback}\n"); sys.stderr.flush()
 
-    # ── 宏观规划已确认 → 解析阶段 + 注入第一阶段详细规划上下文 ──
-    elif state.get("plan_generated") and not state.get("macro_plan_confirmed") and state.get("_intent") == "confirm":
+    # ── 宏观规划已生成 → 立即解析阶段 + 注入第一阶段详细规划上下文（无确认环节） ──
+    elif state.get("plan_generated") and not state.get("macro_plan_confirmed"):
         state["macro_plan_confirmed"] = True
         original = state.get("original_scenario", uid)
 
@@ -286,6 +286,8 @@ async def planning_prep(state: AgentState, deps: Deps = None) -> AgentState:
         if not macro_phases:
             sys.stderr.write(f"[Planning] 未找到宏观规划JSON，无法逐阶段拆解\n"); sys.stderr.flush()
             state["detail_plan_done"] = True
+            state["detail_plan_confirmed"] = True
+            state["pending_question"] = ""
             return state
 
         state["macro_phases"] = macro_phases
@@ -319,6 +321,8 @@ async def planning_prep(state: AgentState, deps: Deps = None) -> AgentState:
         else:
             # 所有阶段拆解完毕
             state["detail_plan_done"] = True
+            state["detail_plan_confirmed"] = True
+            state["pending_question"] = ""
             sys.stderr.write(f"[Planning] 所有 {len(phases)} 个阶段拆解完毕\n"); sys.stderr.flush()
 
     return state

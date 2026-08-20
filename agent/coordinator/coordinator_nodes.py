@@ -112,11 +112,12 @@ async def parameter_collector_node(state: AgentState, deps: Deps) -> AgentState:
     sys.stderr.write(f"[ParameterCollector] session_id={session_id}\n")
     sys.stderr.flush()
     
-    # 第一次进入或 pending_question 已清除：询问用户是否提供完信息
-    # 任务分解失败后（_decompose_failed）放行，允许用户用"确认/重试"重新进入分解
+    # 第一次进入：直接处理用户输入，跳过确认环节
     if (not user_input or user_input == state.get("_last_collected_input", "")) and not state.get("_decompose_failed"):
-        state["pending_question"] = '请确认是否已提供所有必要信息？\n如有补充请输入，如已提供完请输入"确认"。'
-        state["output"] = state["pending_question"]
+        if user_input:
+            state["_last_collected_input"] = user_input
+        state["output"] = "[参数收集] 正在分析任务信息..."
+        state["pending_question"] = ""
         return state
     
     # 任务分解失败后的显式重试：直接重新进入任务分解
@@ -130,7 +131,7 @@ async def parameter_collector_node(state: AgentState, deps: Deps) -> AgentState:
     # 记录本次输入，避免重复处理
     state["_last_collected_input"] = user_input
     
-    # 用户确认完毕
+    # 用户确认完毕（兼容旧逻辑，不再需要但保留）
     if user_input.strip() in ("确认", "确定", "好了", "没有了", "完成", "yes", "ok"):
         state["output"] = "[参数收集完毕] 正在进入任务拆解..."
         state["pending_question"] = ""
@@ -220,7 +221,7 @@ async def parameter_collector_node(state: AgentState, deps: Deps) -> AgentState:
         sys.stderr.flush()
         state["output"] = f"[提取失败] 请用更具体的格式描述，如坐标 (x, y)、文件名 xxx.json 等。"
     
-    state["pending_question"] = '请确认是否已提供所有必要信息？\n如有补充请输入，如已提供完请输入"确认"。'
+    state["pending_question"] = ""
     
     return state
 
@@ -395,7 +396,7 @@ assigned_uav_role 必须与用户说的无人机类型一致。
             if not sub_tasks:
                 state["output"] = "[Coordinator] 任务分解失败：LLM返回的子任务列表为空"
                 state["_decompose_failed"] = True
-                state["pending_question"] = '任务分解失败。请回复"重试"重新分解，或输入"确认"再试一次。'
+                state["pending_question"] = ""
                 return state
             
             # 生成展示文本 - 详细的任务分解
@@ -416,20 +417,16 @@ assigned_uav_role 必须与用户说的无人机类型一致。
                 output += "\n"
             
             output += "=" * 60 + "\n"
-            output += "请确认任务分解方案。确认后我将进行任务分配。\n"
             
             state["output"] = output
-            state["pending_question"] = "确认任务分解方案？（输入确认继续）"
-            print("[DEBUG] decomposer: output + pending_question SET", file=sys.stderr, flush=True)
+            state["pending_question"] = ""
         else:
             state["output"] = "[Coordinator] 任务分解失败，无法解析LLM输出"
             state["_decompose_failed"] = True
-            state["pending_question"] = '任务分解失败。请回复"重试"重新分解，或输入"确认"再试一次。'
-            print("[DEBUG] decomposer: else branch (no pending_question)", file=sys.stderr, flush=True)
+            state["pending_question"] = ""
             
     except Exception as e:
         state["output"] = f"[Coordinator] 任务分解异常: {e}"
-        print(f"[DEBUG] decomposer: EXCEPTION {e}", file=sys.stderr, flush=True)
     
     return state
 
@@ -536,10 +533,9 @@ def task_allocator_node(state: AgentState, deps: Deps) -> AgentState:
         output += f"  执行者: {assignee}{role_info}\n\n"
     
     output += "=" * 60 + "\n"
-    output += "请确认分配方案。确认后我将创建无人机agent并开始执行。\n"
     
     state["output"] = output
-    state["pending_question"] = "确认任务分配？（输入确认后开始执行）"
+    state["pending_question"] = ""
     
     return state
 

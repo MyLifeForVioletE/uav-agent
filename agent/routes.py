@@ -26,9 +26,12 @@ def route_planning_prep(state: AgentState) -> str:
 
 
 def route_call_llm(state: AgentState) -> str:
-    """call_llm → 有工具调用则 execute_tools；详细规划进行中且有下一阶段则回 planning_prep；否则 idle"""
+    """call_llm → 有工具调用则 execute_tools；宏观规划刚生成则去 planning_prep 立即进入详细规划；详细规划进行中且有下一阶段则回 planning_prep；否则 idle"""
     if state.get("_tool_calls"):
         return "execute_tools"
+    # 宏观规划刚生成、尚未确认 → 去 planning_prep 立即确认并启动详细规划
+    if state.get("plan_generated") and not state.get("macro_plan_confirmed"):
+        return "planning_prep"
     # 详细规划逐阶段进行中：还有未拆解的阶段 → 回 planning_prep 注入下一阶段
     if (state.get("macro_plan_confirmed")
             and not state.get("detail_plan_done")
@@ -41,5 +44,5 @@ def route_call_llm(state: AgentState) -> str:
 
 
 def route_execute_tools(state: AgentState) -> str:
-    """execute_tools → 有待确认问题则 idle（等用户回应），否则 call_llm（自动继续）"""
-    return "idle" if state.get("pending_question") else "call_llm"
+    """execute_tools → 始终去 call_llm（自动继续）"""
+    return "call_llm"

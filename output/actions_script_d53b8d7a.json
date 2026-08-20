@@ -83,7 +83,7 @@
             "step_id": "UAV_1-2",
             "subject_id": "UAV_1",
             "step_type": "flight",
-            "step_name": "沿航线飞行到目标T1",
+            "step_name": "沿航线飞行到目标T1位置",
             "input": {
                 "waypoints": [
                     [
@@ -154,7 +154,7 @@
             "step_id": "UAV_1-3",
             "subject_id": "UAV_1",
             "step_type": "sweepFrequencyReconnaissance",
-            "step_name": "执行扫频侦察任务",
+            "step_name": "执行扫频侦察",
             "input": {
                 "targetMinFreq": "2000",
                 "targetMaxFreq": "3000",
@@ -247,7 +247,7 @@
             "step_id": "UAV_1-5",
             "subject_id": "UAV_1",
             "step_type": "flight",
-            "step_name": "沿航线返航",
+            "step_name": "沿航线返航至基地",
             "input": {
                 "waypoints": [
                     [

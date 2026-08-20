@@ -315,10 +315,11 @@ class SubAgent:
 
         # 执行阶段：直接按顺序执行已保存的 detail_actions，跳过 LLM 规划层
         if (self.state.get("detail_plan_confirmed") and self.state.get("detail_actions")
-                and self.state.get("plan_generated") and self.state.get("macro_plan_confirmed")
-                and not self.state.get("pending_question")):
+                and self.state.get("plan_generated") and self.state.get("macro_plan_confirmed")):
+            self.state["pending_question"] = ""
             with timing.track("执行动作"):
                 await self._execute_saved_action_step()
+            self._sync_status()
             return
 
         was_pg = self.state.get("plan_generated", False)
@@ -330,10 +331,6 @@ class SubAgent:
             self._sync_status()
             # 向指挥上报已生成的宏观/详细规划
             await self._report_plans_if_ready()
-            # 规划产出待用户确认 → 通过指挥转达（plan_confirm 请示），挂起等待回复
-            if self._needs_plan_confirm():
-                await self._request_plan_confirmation()
-                return
         except Exception as e:
             self.status = "error"
             self.error = str(e)
@@ -568,16 +565,7 @@ class SubAgent:
             sys.stderr.flush()
 
     def _needs_plan_confirm(self) -> bool:
-        """宏观/详细规划已产出、待用户确认，且尚未发出确认请求时返回 True"""
-        if self._awaiting_reply or self._plan_confirm_requested:
-            return False
-        s = self.state
-        if not s.get("pending_question"):
-            return False
-        if s.get("detail_plan_done") and not s.get("detail_plan_confirmed"):
-            return True
-        if s.get("plan_generated") and not s.get("macro_plan_confirmed"):
-            return True
+        """规划确认已被禁用：始终返回 False，规划产出后自动确认"""
         return False
 
     async def _request_plan_confirmation(self):

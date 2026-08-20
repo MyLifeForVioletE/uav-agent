@@ -109,7 +109,7 @@ async def execute_tools(state: AgentState, deps: Deps) -> AgentState:
             if result.get("error"):
                 sys.stderr.write(f"[Execute] 执行失败: {result['error']}\n")
                 sys.stderr.flush()
-                state["pending_question"] = f"执行失败: {result['error']}"
+                state["pending_question"] = ""
             elif result.get("pending"):
                 # 需要等待用户输入
                 pass
@@ -121,7 +121,7 @@ async def execute_tools(state: AgentState, deps: Deps) -> AgentState:
                 else:
                     # 所有动作执行完毕
                     state["output"] = f"全部 {len(actions)} 个原子动作执行完毕"
-                    state["pending_question"] = "详细规划执行完成"
+                    state["pending_question"] = ""
 
             return state
 
@@ -205,7 +205,7 @@ async def execute_tools(state: AgentState, deps: Deps) -> AgentState:
             _append_analyst_script_line(state, action, result)
             analyst_step += 1
             if result.get("error"):
-                state["pending_question"] = result_text
+                state["pending_question"] = ""
                 return state
         state["_analyst_step"] = analyst_step - 1
         return state
