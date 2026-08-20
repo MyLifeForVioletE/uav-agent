@@ -11,7 +11,7 @@ from typing import Dict
 from core.state import AgentState, Deps
 from core.redis_manager import RedisManager
 from core.config import BASE_DIR, COORDINATOR_ID
-from core.kafka_bus import get_kafka_bus
+from core.memory_bus import get_message_bus, new_msg_id
 from core.timing import timing
 from agent.sub_agent import SubAgent
 from tools.script_writer import write_action_step, write_pause_marker, refresh_dependencies_with_llm
@@ -83,7 +83,7 @@ class FleetManager:
         self._completed_tasks: set = set()            # 已完成的 task_id 集合（执行完成）
         self._dispatched_tasks: set = set()           # 已通过 Kafka 派发的 task_id 集合（每个任务只派发一次）
         self._processor_agent: SubAgent | None = None  # 信息处理类子任务的 agent
-        self._bus = get_kafka_bus()
+        self._bus = get_message_bus()
         # 缺参请示连续卡死 tick 阈值：超过则强制跳过动作（见 _resolve_stuck_param_waits）
         self._STUCK_AWAIT_TICKS = 2
         # 连续无推进 tick 阈值：超过则强制结束，避免无限空转刷屏

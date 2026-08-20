@@ -35,7 +35,7 @@
           "type":"file",
           "description":"盲区信息的文件"
         },
-        "CoverageArea":{
+        "coverageArea":{
           "type":"file",
           "description":"畅通区信息的文件"
         }

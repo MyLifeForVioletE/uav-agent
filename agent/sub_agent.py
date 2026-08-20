@@ -12,7 +12,7 @@ from core.prompts import SYSTEM_PROMPT, ANALYST_SYSTEM_PROMPT
 from core.redis_manager import RedisManager
 from core.ollama_utils import filter_tools_for_role
 from core.config import COORDINATOR_ID
-from core.kafka_bus import get_kafka_bus, new_msg_id
+from core.memory_bus import get_message_bus, new_msg_id
 from core.timing import timing
 from agent.graph import build_graph
 from agent.analyst_graph import build_analyst_graph
@@ -54,7 +54,7 @@ class SubAgent:
         self._max_planning_retries = 5
         self._last_pg_state = False
         # Kafka 消息总线（三种 agent 间通信）
-        self._bus = get_kafka_bus()
+        self._bus = get_message_bus()
         self._awaiting_reply: str | None = None   # 同步请示：等待的 correlation_id
         self._plan_confirm_requested: str | None = None   # 已请求用户确认的规划类型（macro_plan/detail_plan）
 
@@ -474,7 +474,7 @@ class SubAgent:
             return
         try:
             from tools.script_writer import write_contingency_plan
-            write_contingency_plan(self._session_id, self.state.get("detail_actions", []))
+            write_contingency_plan(self._session_id, self.state.get("detail_actions", []), subject_id=self.agent_id)
             self._contingency_plan_written = True
         except Exception as e:
             sys.stderr.write(f"[SubAgent {self.agent_id}] contingency 文件写入失败: {e}\n")

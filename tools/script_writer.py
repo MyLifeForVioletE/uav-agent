@@ -260,12 +260,29 @@ def resolve_contingency_target(actions: list, raw: str) -> tuple:
     return "", raw
 
 
-def write_contingency_plan(session_id: str, actions: list):
+def _read_contingency_plan(session_id: str) -> list:
+    """读取现有异常应对文件中的 plan 列表（文件缺失/损坏时返回空列表）"""
+    path = contingency_plan_path(session_id)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        plan = data.get("plan")
+        return plan if isinstance(plan, list) else []
+    except Exception:
+        return []
+
+
+def write_contingency_plan(session_id: str, actions: list, subject_id: str = ""):
     """agent 详细规划动作全部执行完后，将每个动作的异常应对措施写入独立文件。
 
     - 每个动作的 contingency（LLM 在完整详细规划后统一生成，按 action_name 引用同计划动作）
       在此处与规划出的动作列表匹配，解析为 action_id（状态图节点间的条件转移边）；
       匹配到计划内动作时 action_name 规范化为该动作的真实 action_name，保证与 action_id 一致。
+    - 保留自环条目（如"规划失败→规划返航航线"＝异常时重跑该动作，属正常应对逻辑）；
+      仅丢弃无法解析到有效目标（action_id 为空）的条目。
+    - 多 agent 各自写入同一个文件：采用合并（按 subject_id+action_name+goal 去重）而非覆盖，
+      否则只有最后完成的 agent 的数据能保留下来。
     - 文件：output/contingency_plan_{session_id}.json
     """
     plan = []
@@ -275,6 +292,7 @@ def write_contingency_plan(session_id: str, actions: list):
         contingency = a.get("contingency") or []
         if not contingency:
             continue
+        self_id = a.get("action_id", "")
         resolved = []
         for item in contingency:
             if not isinstance(item, dict):
@@ -282,14 +300,20 @@ def write_contingency_plan(session_id: str, actions: list):
             cond = item.get("condition", "")
             raw = item.get("action_name", "")
             tid, tname = resolve_contingency_target(actions, raw)
+            if not tid:
+                # 无法解析到有效目标：丢弃（保留 action_id 为空的条目无意义）
+                continue
             resolved.append({
                 "condition": cond,
                 "action_id": tid,
                 "action_name": tname,
             })
+        if not resolved:
+            continue
         plan.append({
             "step": step,
-            "action_id": a.get("action_id", ""),
+            "subject_id": subject_id,
+            "action_id": self_id,
             "action_name": a.get("action_name", ""),
             "tool_name": a.get("tool_name", ""),
             "goal": a.get("goal", ""),
@@ -299,12 +323,23 @@ def write_contingency_plan(session_id: str, actions: list):
         sys.stderr.write("[ScriptWriter] 无 contingency 数据，跳过写入异常应对文件\n")
         sys.stderr.flush()
         return
+    # 合并已存在的条目，避免后完成的 agent 覆盖先完成的
+    existing = _read_contingency_plan(session_id)
+    seen = {
+        (e.get("subject_id", ""), e.get("action_name", ""), e.get("goal", ""))
+        for e in existing
+    }
+    for e in plan:
+        key = (subject_id, e.get("action_name", ""), e.get("goal", ""))
+        if key not in seen:
+            existing.append(e)
+            seen.add(key)
     try:
         contingency_plan_path(session_id).write_text(
-            json.dumps({"plan": plan}, ensure_ascii=False, indent=4),
+            json.dumps({"plan": existing}, ensure_ascii=False, indent=4),
             encoding="utf-8",
         )
-        sys.stderr.write(f"[ScriptWriter] 已写入异常应对文件 contingency_plan_{session_id}.json（{len(plan)} 条）\n")
+        sys.stderr.write(f"[ScriptWriter] 已写入异常应对文件 contingency_plan_{session_id}.json（共 {len(existing)} 条）\n")
         sys.stderr.flush()
     except Exception as e:
         sys.stderr.write(f"[ScriptWriter] contingency 文件写入失败: {e}\n")

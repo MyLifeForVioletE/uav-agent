@@ -1,4 +1,5 @@
 """call_llm 节点：调用 Ollama API 并处理响应"""
+import asyncio
 import json
 import sys
 
@@ -46,6 +47,14 @@ async def call_llm(state: AgentState, deps: Deps) -> AgentState:
                     detail = e.response.text[:500]
                 except Exception:
                     pass
+            sys.stderr.write(f"[LLM] Ollama 调用失败(第{attempt}次): {e}\n{detail}\n"); sys.stderr.flush()
+            # 瞬时故障（超时/连接断开等）重试：Ollama 串行处理多 agent 请求，
+            # 排队等待会把单次调用拖过超时阈值；重试时队列通常已排空，可成功。
+            # 重试上限与下方 JSON 无效重试一致（MAX_PLAN_ATTEMPTS）。
+            if attempt < MAX_PLAN_ATTEMPTS:
+                sys.stderr.write(f"[LLM] 调用失败，{2.0 * attempt}s 后重试(第{attempt + 1}/{MAX_PLAN_ATTEMPTS}次)...\n"); sys.stderr.flush()
+                await asyncio.sleep(2.0 * attempt)
+                continue
             aim = AIMessage(content=f"（调用 Ollama 失败：{e}\n{detail}）")
             state["messages"].append(aim)
             state["output"] = aim.content
@@ -142,6 +151,11 @@ async def call_llm(state: AgentState, deps: Deps) -> AgentState:
         phases = state.get("macro_phases", [])
         idx = state.get("current_phase_idx", 0)
         if phases and idx >= len(phases) - 1:
+            # 归一化 action_id：逐阶段规划时 LLM 可能每阶段重新编号（重复 action_1/action_2），
+            # 造成本 agent 内编号冲突、contingency 引用错乱；按本 agent 自己的动作列表
+            # 从 1 开始重排（action_1..action_N），不跨 agent 累加。
+            for _i, _a in enumerate(state.get("detail_actions", []), 1):
+                _a["action_id"] = f"action_{_i}"
             state["detail_plan_done"] = True
             state["detail_plan_confirmed"] = True
             # 完整详细规划生成后：基于全部动作列表统一生成各动作的异常应对措施（contingency）
@@ -163,6 +177,9 @@ async def call_llm(state: AgentState, deps: Deps) -> AgentState:
         actions = (data.get("actions") if data else None) or (data.get("atomic_actions") if data else None) or []
         if actions:
             state["detail_actions"] = actions
+            # 归一化 action_id：重规划替换全部动作，同样按本 agent 从 1 开始重排
+            for _i, _a in enumerate(actions, 1):
+                _a["action_id"] = f"action_{_i}"
             state["detail_plan_done"] = True
             state["detail_plan_confirmed"] = True
             # 重规划替换了全部动作：重置标记并基于新计划重新生成 contingency
